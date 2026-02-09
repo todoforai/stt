@@ -1,0 +1,6 @@
+numpy
+soundfile
+sounddevice
+torch
+safetensors
+nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git
