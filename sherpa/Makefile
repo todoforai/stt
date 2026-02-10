@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -O2 -Wall -Wextra -Ilibs/include
 LDFLAGS = -Llibs/lib -Wl,-rpath,'$$ORIGIN/libs/lib'
-LIBS = -lsherpa-onnx-c-api -lportaudio -lpthread
+LIBS = -lsherpa-onnx-c-api -lportaudio -lpthread -lX11 -lXtst
 
 dictate: dictate.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)

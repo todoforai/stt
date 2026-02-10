@@ -16,17 +16,21 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <X11/Xlib.h>
+#include <X11/XKBlib.h>
+#include <X11/keysym.h>
+#include <X11/extensions/XTest.h>
 #include <portaudio.h>
 #include <sherpa-onnx/c-api/c-api.h>
 
 /* ── Constants (matching Python version) ──────────────────────────────────── */
 
 #define SAMPLE_RATE      16000
-#define NUM_THREADS      4
+#define NUM_THREADS      8
 #define VAD_THRESHOLD    0.5f
-#define VAD_MIN_SILENCE  0.7f
+#define VAD_MIN_SILENCE  0.4f
 #define VAD_MIN_SPEECH   0.3f
-#define VAD_MAX_SPEECH   30.0f
+#define VAD_MAX_SPEECH   5.0f
 #define VAD_WINDOW_SIZE  512
 #define MAX_QUEUE_SIZE   5
 
@@ -121,55 +125,50 @@ static pthread_mutex_t g_vad_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* Path prefix for models (set from argv[0] location) */
 static char g_basedir[4096];
 
-/* ── Clipboard paste utilities ────────────────────────────────────────────── */
+/* ── XTest direct text injection (no fork, no clipboard, single flush) ────── */
 
-static int is_wayland(void) {
-    const char *s = getenv("XDG_SESSION_TYPE");
-    return s && strcmp(s, "wayland") == 0;
-}
+static Display *g_dpy = NULL;
+static KeyCode  g_shift;
 
-static void check_paste_deps(void) {
-    int wayland = is_wayland();
-    int ok = 1;
-    if (wayland) {
-        if (system("which wl-copy >/dev/null 2>&1") != 0) {
-            fprintf(stderr, "  MISSING: wl-copy (sudo apt install wl-clipboard)\n");
-            ok = 0;
-        }
-        if (system("which wtype >/dev/null 2>&1") != 0) {
-            fprintf(stderr, "  MISSING: wtype (sudo apt install wtype)\n");
-            ok = 0;
-        }
-    } else {
-        if (system("which xclip >/dev/null 2>&1") != 0) {
-            fprintf(stderr, "  MISSING: xclip (sudo apt install xclip)\n");
-            ok = 0;
-        }
-        if (system("which xdotool >/dev/null 2>&1") != 0) {
-            fprintf(stderr, "  MISSING: xdotool (sudo apt install xdotool)\n");
-            ok = 0;
-        }
-    }
-    if (!ok) {
-        fprintf(stderr, "ERROR: Missing dependencies for clipboard paste.\n");
+static void x11_init(void) {
+    g_dpy = XOpenDisplay(NULL);
+    if (!g_dpy) {
+        fprintf(stderr, "ERROR: Cannot open X11 display ($DISPLAY=%s)\n",
+                getenv("DISPLAY") ? getenv("DISPLAY") : "unset");
         exit(1);
     }
+    int ev, er, maj, min;
+    if (!XTestQueryExtension(g_dpy, &ev, &er, &maj, &min)) {
+        fprintf(stderr, "ERROR: XTest extension not available.\n");
+        exit(1);
+    }
+    g_shift = XKeysymToKeycode(g_dpy, XK_Shift_L);
 }
 
-static void clipboard_paste(const char *text) {
-    if (!text || !text[0]) return;
+static void x11_cleanup(void) {
+    if (g_dpy) { XCloseDisplay(g_dpy); g_dpy = NULL; }
+}
 
-    if (is_wayland()) {
-        /* wl-copy -- <text> */
-        FILE *fp = popen("wl-copy --", "w");
-        if (fp) { fputs(text, fp); pclose(fp); }
-        (void)!system("wtype -M ctrl v -m ctrl");
-    } else {
-        /* xclip -selection clipboard */
-        FILE *fp = popen("xclip -selection clipboard", "w");
-        if (fp) { fputs(text, fp); pclose(fp); }
-        (void)!system("xdotool key --clearmodifiers ctrl+v");
+static void type_text(const char *text) {
+    if (!g_dpy || !text || !text[0]) return;
+
+    for (const char *p = text; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x20 || c > 0x7e) continue;
+
+        KeySym ks = (KeySym)c;
+        KeyCode kc = XKeysymToKeycode(g_dpy, ks);
+        if (kc == 0) continue;
+
+        /* Check if shift needed: compare with unshifted keysym at this keycode */
+        int need_shift = (XkbKeycodeToKeysym(g_dpy, kc, 0, 0) != ks);
+
+        if (need_shift) XTestFakeKeyEvent(g_dpy, g_shift, True, 0);
+        XTestFakeKeyEvent(g_dpy, kc, True, 0);
+        XTestFakeKeyEvent(g_dpy, kc, False, 0);
+        if (need_shift) XTestFakeKeyEvent(g_dpy, g_shift, False, 0);
     }
+    XFlush(g_dpy);
 }
 
 /* ── Garbage filter ───────────────────────────────────────────────────────── */
@@ -262,6 +261,12 @@ static int pa_callback(const void *input, void *output,
 
 /* ── Transcription worker thread ──────────────────────────────────────────── */
 
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
 static void *transcription_worker(void *arg) {
     (void)arg;
     AudioSegment seg;
@@ -274,9 +279,11 @@ static void *transcription_worker(void *arg) {
         fprintf(stderr, "\r\033[K  [transcribing %.1fs...]", duration);
         fflush(stderr);
 
+        double t0 = now_ms();
         const SherpaOnnxOfflineStream *stream = SherpaOnnxCreateOfflineStream(g_recognizer);
         SherpaOnnxAcceptWaveformOffline(stream, SAMPLE_RATE, seg.samples, seg.n);
         SherpaOnnxDecodeOfflineStream(g_recognizer, stream);
+        double t1 = now_ms();
 
         const SherpaOnnxOfflineRecognizerResult *r = SherpaOnnxGetOfflineStreamResult(stream);
         if (r && r->text && !is_garbage(r->text)) {
@@ -284,16 +291,19 @@ static void *transcription_worker(void *arg) {
             const char *text = r->text;
             while (*text && isspace((unsigned char)*text)) text++;
 
-            fprintf(stderr, "\r\033[K  >> %s\n", text);
-
-            /* Append space and paste */
+            /* Append space and type */
             size_t tlen = strlen(text);
             char *buf = (char *)malloc(tlen + 2);
             if (buf) {
                 memcpy(buf, text, tlen);
                 buf[tlen] = ' ';
                 buf[tlen + 1] = '\0';
-                clipboard_paste(buf);
+                double t2 = now_ms();
+                type_text(buf);
+                double t3 = now_ms();
+                fprintf(stderr, "\r\033[K  >> %s\n", text);
+                fprintf(stderr, "     [%.1fs audio | recognize: %.0fms | type: %.0fms | total: %.0fms]\n",
+                        duration, t1 - t0, t3 - t2, t3 - t0);
                 free(buf);
             }
         } else {
@@ -367,8 +377,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Check paste dependencies */
-    check_paste_deps();
+    /* Init X11 for text injection */
+    x11_init();
 
     /* ── Load recognizer ────────────────────────────────────────────────── */
     printf("Loading Parakeet-TDT 0.6B v3 int8...\n");
@@ -476,6 +486,7 @@ int main(int argc, char *argv[]) {
     SherpaOnnxDestroyVoiceActivityDetector(g_vad);
     SherpaOnnxDestroyOfflineRecognizer(g_recognizer);
 
+    x11_cleanup();
     printf("Bye!\n");
     return 0;
 }
