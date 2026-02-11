@@ -3,7 +3,7 @@
  *
  * Single-file, zero Python dependencies. Links against libsherpa-onnx-c-api
  * and libportaudio. Uses Parakeet-TDT 0.6B v3 int8 + Silero VAD.
- * Text injection via wtype (Wayland).
+ * Text injection via /dev/uinput + xkbcommon (layout-aware, any compositor).
  *
  * Build:  make
  * Run:    ./dictate
@@ -17,10 +17,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/wait.h>
 
+#include <linux/input.h>
 #include <portaudio.h>
 #include <sherpa-onnx/c-api/c-api.h>
+#include "typer.h"
 
 /* ── Constants (matching Python version) ──────────────────────────────────── */
 
@@ -119,23 +120,53 @@ static SegmentQueue g_queue;
 /* Audio buffer for accumulating samples before feeding VAD */
 static float  g_audio_buf[SAMPLE_RATE]; /* up to 1s buffer */
 static int    g_audio_buf_len = 0;
-static pthread_mutex_t g_vad_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Path prefix for models (set from argv[0] location) */
 static char g_basedir[4096];
 
-/* ── Text injection via wtype (Wayland) ───────────────────────────────────── */
+/* ── Voice commands (trailing phrase → key press) ─────────────────────────── */
 
-static void type_text(const char *text) {
-    if (!text || !text[0]) return;
+typedef struct {
+    const char *phrase;    /* lowercase trailing phrase to match */
+    int         keycode;   /* linux evdev keycode */
+    int         ctrl;      /* hold Ctrl? */
+    const char *label;     /* for logging */
+} VoiceCommand;
 
-    pid_t pid = fork();
-    if (pid == 0) {
-        execlp("wtype", "wtype", "--", text, NULL);
-        _exit(1);
-    } else if (pid > 0) {
-        waitpid(pid, NULL, 0);
+static const VoiceCommand g_commands[] = {
+    { "press enter", KEY_ENTER, 0, "Enter"  },
+    { "press tab",   KEY_TAB,   0, "Tab"    },
+    { "interrupt it", KEY_C,     1, "Ctrl+C" },
+    { "cancel it",    KEY_C,     1, "Ctrl+C" },
+    { NULL, 0, 0, NULL }
+};
+
+/* Check if text ends with a voice command (case-insensitive).
+ * Returns the command, or NULL. Sets *cmd_start to where the phrase begins. */
+static const VoiceCommand *match_trailing_command(const char *text, int len, int *cmd_start) {
+    for (const VoiceCommand *cmd = g_commands; cmd->phrase; cmd++) {
+        int plen = (int)strlen(cmd->phrase);
+        if (plen > len) continue;
+
+        const char *suffix = text + len - plen;
+
+        /* Case-insensitive compare */
+        int match = 1;
+        for (int i = 0; i < plen; i++) {
+            if (tolower((unsigned char)suffix[i]) != cmd->phrase[i]) {
+                match = 0;
+                break;
+            }
+        }
+        if (!match) continue;
+
+        /* Must be at word boundary (start of string or preceded by space) */
+        if (suffix > text && suffix[-1] != ' ') continue;
+
+        *cmd_start = (int)(suffix - text);
+        return cmd;
     }
+    return NULL;
 }
 
 /* ── Garbage filter ───────────────────────────────────────────────────────── */
@@ -182,8 +213,6 @@ static int pa_callback(const void *input, void *output,
     const float *in = (const float *)input;
     if (!in) return paContinue;
 
-    pthread_mutex_lock(&g_vad_mutex);
-
     /* Accumulate into buffer */
     int to_copy = (int)frame_count;
     if (g_audio_buf_len + to_copy > SAMPLE_RATE)
@@ -222,7 +251,6 @@ static int pa_callback(const void *input, void *output,
         SherpaOnnxVoiceActivityDetectorPop(g_vad);
     }
 
-    pthread_mutex_unlock(&g_vad_mutex);
     return paContinue;
 }
 
@@ -258,21 +286,52 @@ static void *transcription_worker(void *arg) {
             const char *text = r->text;
             while (*text && isspace((unsigned char)*text)) text++;
 
-            /* Append space and type */
-            size_t tlen = strlen(text);
-            char *buf = (char *)malloc(tlen + 2);
-            if (buf) {
-                memcpy(buf, text, tlen);
-                buf[tlen] = ' ';
-                buf[tlen + 1] = '\0';
-                double t2 = now_ms();
-                type_text(buf);
-                double t3 = now_ms();
-                fprintf(stderr, "\r\033[K  >> %s\n", text);
-                fprintf(stderr, "     [%.1fs audio | recognize: %.0fms | type: %.0fms | total: %.0fms]\n",
-                        duration, t1 - t0, t3 - t2, t3 - t0);
-                free(buf);
+            int tlen = (int)strlen(text);
+            /* Trim trailing whitespace and punctuation */
+            while (tlen > 0 && (isspace((unsigned char)text[tlen - 1])
+                   || text[tlen - 1] == '.' || text[tlen - 1] == ','
+                   || text[tlen - 1] == '!' || text[tlen - 1] == '?'))
+                tlen--;
+
+            /* Check for trailing voice command */
+            int cmd_start = tlen;
+            const VoiceCommand *cmd = match_trailing_command(text, tlen, &cmd_start);
+
+            /* Strip trailing space before the command */
+            int text_len = cmd_start;
+            while (text_len > 0 && text[text_len - 1] == ' ') text_len--;
+
+            double t2 = now_ms();
+
+            /* Type the text portion (if any) */
+            if (text_len > 0) {
+                char *buf = (char *)malloc(text_len + 2);
+                if (buf) {
+                    memcpy(buf, text, text_len);
+                    buf[text_len] = ' ';
+                    buf[text_len + 1] = '\0';
+                    typer_type(buf);
+                    free(buf);
+                }
             }
+
+            /* Fire the key command (if matched) */
+            if (cmd) {
+                typer_press(cmd->keycode, cmd->ctrl);
+            }
+
+            double t3 = now_ms();
+
+            /* Log */
+            if (cmd && text_len > 0) {
+                fprintf(stderr, "\r\033[K  >> %.*s  [%s]\n", text_len, text, cmd->label);
+            } else if (cmd) {
+                fprintf(stderr, "\r\033[K  >> [%s]\n", cmd->label);
+            } else {
+                fprintf(stderr, "\r\033[K  >> %.*s\n", tlen, text);
+            }
+            fprintf(stderr, "     [%.1fs audio | recognize: %.0fms | type: %.0fms | total: %.0fms]\n",
+                    duration, t1 - t0, t3 - t2, t3 - t0);
         } else {
             fprintf(stderr, "\r\033[K");
             fflush(stderr);
@@ -344,12 +403,9 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Check wtype is available */
-    if (system("command -v wtype >/dev/null 2>&1") != 0) {
-        fprintf(stderr, "ERROR: wtype not found. Install with: sudo apt install wtype\n");
+    /* Initialize text injection (uinput + xkbcommon) */
+    if (typer_init() != 0)
         return 1;
-    }
-    printf("  Text injection: wtype (Wayland)\n");
 
     /* ── Load recognizer ────────────────────────────────────────────────── */
     printf("Loading Parakeet-TDT 0.6B v3 int8...\n");
@@ -454,6 +510,7 @@ int main(int argc, char *argv[]) {
     pthread_join(worker, NULL);
 
     queue_destroy(&g_queue);
+    typer_cleanup();
     SherpaOnnxDestroyVoiceActivityDetector(g_vad);
     SherpaOnnxDestroyOfflineRecognizer(g_recognizer);
 

@@ -44,12 +44,17 @@ if ! echo '#include <portaudio.h>' | gcc -E -x c - >/dev/null 2>&1; then
     missing="$missing portaudio19-dev"
 fi
 
+# Check for xkbcommon header
+if ! echo '#include <xkbcommon/xkbcommon.h>' | gcc -E -x c - >/dev/null 2>&1; then
+    missing="$missing libxkbcommon-dev"
+fi
+
 if [ -n "$missing" ]; then
     echo "  MISSING: $missing"
     echo "  Install with: sudo apt install $missing"
     exit 1
 fi
-echo "  OK (gcc + portaudio19-dev)"
+echo "  OK (gcc + portaudio19-dev + libxkbcommon-dev)"
 
 # ── Create models dir ────────────────────────────────────────────────────────
 
@@ -80,14 +85,15 @@ else
     echo "Silero VAD ready."
 fi
 
-# ── Check wtype dependency ────────────────────────────────────────────────────
+# ── Check /dev/uinput access ─────────────────────────────────────────────────
 
 echo ""
-echo "Checking text injection dependency..."
-if command -v wtype >/dev/null 2>&1; then
-    echo "  OK (wtype found)"
+echo "Checking /dev/uinput access..."
+if [ -w /dev/uinput ]; then
+    echo "  OK (/dev/uinput writable)"
 else
-    echo "  MISSING: wtype (sudo apt install wtype)"
+    echo "  WARNING: /dev/uinput not writable"
+    echo "  Fix with: sudo usermod -aG input $USER  (then re-login)"
 fi
 
 # ── Build C binary ───────────────────────────────────────────────────────────
