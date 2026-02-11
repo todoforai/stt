@@ -80,20 +80,14 @@ else
     echo "Silero VAD ready."
 fi
 
-# ── Check paste dependencies ─────────────────────────────────────────────────
+# ── Check wtype dependency ────────────────────────────────────────────────────
 
 echo ""
-echo "Checking clipboard paste dependencies..."
-if [ "${XDG_SESSION_TYPE:-}" = "wayland" ]; then
-    ok=true
-    command -v wl-copy >/dev/null 2>&1 || { echo "  MISSING: wl-copy (sudo apt install wl-clipboard)"; ok=false; }
-    command -v wtype >/dev/null 2>&1  || { echo "  MISSING: wtype (sudo apt install wtype)"; ok=false; }
-    $ok && echo "  OK (Wayland: wl-copy + wtype)"
+echo "Checking text injection dependency..."
+if command -v wtype >/dev/null 2>&1; then
+    echo "  OK (wtype found)"
 else
-    ok=true
-    command -v xclip >/dev/null 2>&1   || { echo "  MISSING: xclip (sudo apt install xclip)"; ok=false; }
-    command -v xdotool >/dev/null 2>&1 || { echo "  MISSING: xdotool (sudo apt install xdotool)"; ok=false; }
-    $ok && echo "  OK (X11: xclip + xdotool)"
+    echo "  MISSING: wtype (sudo apt install wtype)"
 fi
 
 # ── Build C binary ───────────────────────────────────────────────────────────

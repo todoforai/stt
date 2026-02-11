@@ -3,6 +3,7 @@
  *
  * Single-file, zero Python dependencies. Links against libsherpa-onnx-c-api
  * and libportaudio. Uses Parakeet-TDT 0.6B v3 int8 + Silero VAD.
+ * Text injection via wtype (Wayland).
  *
  * Build:  make
  * Run:    ./dictate
@@ -11,15 +12,13 @@
 #include <ctype.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
-#include <X11/Xlib.h>
-#include <X11/XKBlib.h>
-#include <X11/keysym.h>
-#include <X11/extensions/XTest.h>
 #include <portaudio.h>
 #include <sherpa-onnx/c-api/c-api.h>
 
@@ -125,50 +124,18 @@ static pthread_mutex_t g_vad_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* Path prefix for models (set from argv[0] location) */
 static char g_basedir[4096];
 
-/* ── XTest direct text injection (no fork, no clipboard, single flush) ────── */
-
-static Display *g_dpy = NULL;
-static KeyCode  g_shift;
-
-static void x11_init(void) {
-    g_dpy = XOpenDisplay(NULL);
-    if (!g_dpy) {
-        fprintf(stderr, "ERROR: Cannot open X11 display ($DISPLAY=%s)\n",
-                getenv("DISPLAY") ? getenv("DISPLAY") : "unset");
-        exit(1);
-    }
-    int ev, er, maj, min;
-    if (!XTestQueryExtension(g_dpy, &ev, &er, &maj, &min)) {
-        fprintf(stderr, "ERROR: XTest extension not available.\n");
-        exit(1);
-    }
-    g_shift = XKeysymToKeycode(g_dpy, XK_Shift_L);
-}
-
-static void x11_cleanup(void) {
-    if (g_dpy) { XCloseDisplay(g_dpy); g_dpy = NULL; }
-}
+/* ── Text injection via wtype (Wayland) ───────────────────────────────────── */
 
 static void type_text(const char *text) {
-    if (!g_dpy || !text || !text[0]) return;
+    if (!text || !text[0]) return;
 
-    for (const char *p = text; *p; p++) {
-        unsigned char c = (unsigned char)*p;
-        if (c < 0x20 || c > 0x7e) continue;
-
-        KeySym ks = (KeySym)c;
-        KeyCode kc = XKeysymToKeycode(g_dpy, ks);
-        if (kc == 0) continue;
-
-        /* Check if shift needed: compare with unshifted keysym at this keycode */
-        int need_shift = (XkbKeycodeToKeysym(g_dpy, kc, 0, 0) != ks);
-
-        if (need_shift) XTestFakeKeyEvent(g_dpy, g_shift, True, 0);
-        XTestFakeKeyEvent(g_dpy, kc, True, 0);
-        XTestFakeKeyEvent(g_dpy, kc, False, 0);
-        if (need_shift) XTestFakeKeyEvent(g_dpy, g_shift, False, 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+        execlp("wtype", "wtype", "--", text, NULL);
+        _exit(1);
+    } else if (pid > 0) {
+        waitpid(pid, NULL, 0);
     }
-    XFlush(g_dpy);
 }
 
 /* ── Garbage filter ───────────────────────────────────────────────────────── */
@@ -191,7 +158,7 @@ static int is_garbage(const char *text) {
     int unique = 0;
     for (int i = 0; i < len; i++) {
         unsigned char c = (unsigned char)text[i];
-        if (isalnum(c)) has_alnum = 1;
+        if (isalnum(c) || c >= 0xC0) has_alnum = 1; /* ASCII alnum or UTF-8 lead byte */
         if (!seen[c]) { seen[c] = 1; unique++; }
     }
 
@@ -377,8 +344,12 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Init X11 for text injection */
-    x11_init();
+    /* Check wtype is available */
+    if (system("command -v wtype >/dev/null 2>&1") != 0) {
+        fprintf(stderr, "ERROR: wtype not found. Install with: sudo apt install wtype\n");
+        return 1;
+    }
+    printf("  Text injection: wtype (Wayland)\n");
 
     /* ── Load recognizer ────────────────────────────────────────────────── */
     printf("Loading Parakeet-TDT 0.6B v3 int8...\n");
@@ -486,7 +457,6 @@ int main(int argc, char *argv[]) {
     SherpaOnnxDestroyVoiceActivityDetector(g_vad);
     SherpaOnnxDestroyOfflineRecognizer(g_recognizer);
 
-    x11_cleanup();
     printf("Bye!\n");
     return 0;
 }
