@@ -76,6 +76,34 @@ def clipboard_paste(text):
         subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+v"], check=False)
 
 
+def press_enter():
+    """Simulate pressing Enter."""
+    if _is_wayland():
+        subprocess.run(["wtype", "-k", "Return"], check=False)
+    else:
+        subprocess.run(["xdotool", "key", "--clearmodifiers", "Return"], check=False)
+
+
+# Voice commands: trailing phrases that trigger a key press
+VOICE_COMMANDS = [
+    ("do it now", press_enter),
+    ("press enter", press_enter),
+]
+
+
+def match_voice_command(text: str):
+    """Check if text ends with a voice command. Returns (clean_text, command_fn) or (text, None)."""
+    lower = text.lower().rstrip(" .!?,")
+    for phrase, fn in VOICE_COMMANDS:
+        if lower.endswith(phrase):
+            # Strip the command phrase from the end
+            clean = lower[:len(lower) - len(phrase)].rstrip()
+            # Recover original casing for the text portion
+            clean = text[:len(clean)].rstrip()
+            return clean, fn
+    return text, None
+
+
 def check_server_health():
     """Ping the server with a zero-length request; expects 'OK' back."""
     try:
@@ -278,8 +306,17 @@ class Dictation:
             try:
                 text = transcribe_remote(audio)
                 if text and not _is_garbage(text):
-                    print(f"\r\033[K  >> {text}")
-                    clipboard_paste(text + " ")
+                    clean_text, cmd_fn = match_voice_command(text)
+                    if cmd_fn and clean_text:
+                        print(f"\r\033[K  >> {clean_text}  [+ command]")
+                        clipboard_paste(clean_text + " ")
+                        cmd_fn()
+                    elif cmd_fn:
+                        print(f"\r\033[K  >> [command only]")
+                        cmd_fn()
+                    else:
+                        print(f"\r\033[K  >> {text}")
+                        clipboard_paste(text + " ")
                 else:
                     print("\r\033[K", end="", flush=True)
             except (ConnectionRefusedError, FileNotFoundError):

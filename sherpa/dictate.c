@@ -30,7 +30,7 @@
 #define VAD_THRESHOLD    0.5f
 #define VAD_MIN_SILENCE  0.4f
 #define VAD_MIN_SPEECH   0.3f
-#define VAD_MAX_SPEECH   5.0f
+#define VAD_MAX_SPEECH   30.0f
 #define VAD_WINDOW_SIZE  512
 #define MAX_QUEUE_SIZE   5
 
@@ -113,6 +113,8 @@ static int queue_pop(SegmentQueue *q, AudioSegment *out, volatile int *running) 
 /* ── Globals ──────────────────────────────────────────────────────────────── */
 
 static volatile int g_running = 1;
+static volatile int g_paused  = 0;
+static PaStream    *g_stream  = NULL;   /* for pause/resume */
 static const SherpaOnnxOfflineRecognizer *g_recognizer = NULL;
 static const SherpaOnnxVoiceActivityDetector *g_vad = NULL;
 static SegmentQueue g_queue;
@@ -134,8 +136,9 @@ typedef struct {
 } VoiceCommand;
 
 static const VoiceCommand g_commands[] = {
-    { "press enter", KEY_ENTER, 0, "Enter"  },
-    { "press tab",   KEY_TAB,   0, "Tab"    },
+    { "do it now",    KEY_ENTER, 0, "Enter"  },
+    { "press enter",  KEY_ENTER, 0, "Enter"  },
+    { "press tab",    KEY_TAB,   0, "Tab"    },
     { "interrupt it", KEY_C,     1, "Ctrl+C" },
     { "cancel it",    KEY_C,     1, "Ctrl+C" },
     { NULL, 0, 0, NULL }
@@ -211,7 +214,7 @@ static int pa_callback(const void *input, void *output,
 {
     (void)output; (void)time_info; (void)status_flags; (void)user_data;
     const float *in = (const float *)input;
-    if (!in) return paContinue;
+    if (!in || g_paused) return paContinue;
 
     /* Accumulate into buffer */
     int to_copy = (int)frame_count;
@@ -351,6 +354,21 @@ static void on_signal(int sig) {
     g_running = 0;
 }
 
+static void on_toggle(int sig) {
+    (void)sig;
+    g_paused = !g_paused;
+    if (g_paused) {
+        Pa_StopStream(g_stream);
+        /* Reset VAD state so we start clean on resume */
+        SherpaOnnxVoiceActivityDetectorReset(g_vad);
+        g_audio_buf_len = 0;
+        fprintf(stderr, "\r\033[K  [PAUSED — press F9 to resume]\n");
+    } else {
+        Pa_StartStream(g_stream);
+        fprintf(stderr, "\r\033[K  [RESUMED — listening...]\n");
+    }
+}
+
 /* ── Resolve base directory from argv[0] ──────────────────────────────────── */
 
 static void resolve_basedir(const char *argv0) {
@@ -463,8 +481,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    PaStream *stream = NULL;
-    err = Pa_OpenDefaultStream(&stream, 1, 0, paFloat32, SAMPLE_RATE,
+    err = Pa_OpenDefaultStream(&g_stream, 1, 0, paFloat32, SAMPLE_RATE,
                                VAD_WINDOW_SIZE, pa_callback, NULL);
     if (err != paNoError) {
         fprintf(stderr, "ERROR: Pa_OpenDefaultStream failed: %s\n", Pa_GetErrorText(err));
@@ -472,10 +489,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    err = Pa_StartStream(stream);
+    err = Pa_StartStream(g_stream);
     if (err != paNoError) {
         fprintf(stderr, "ERROR: Pa_StartStream failed: %s\n", Pa_GetErrorText(err));
-        Pa_CloseStream(stream);
+        Pa_CloseStream(g_stream);
         Pa_Terminate();
         return 1;
     }
@@ -485,12 +502,13 @@ int main(int argc, char *argv[]) {
     printf("==================================================\n");
     printf("  DICTATION ACTIVE — just speak!\n");
     printf("  Model: Parakeet-TDT 0.6B v3 int8 (CPU)\n");
-    printf("  Ctrl+C to quit\n");
+    printf("  F9 to pause/resume, Ctrl+C to quit\n");
     printf("==================================================\n");
     printf("\n  Listening...\n\n");
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+    signal(SIGUSR1, on_toggle);
 
     while (g_running) {
         Pa_Sleep(100);
@@ -499,8 +517,8 @@ int main(int argc, char *argv[]) {
     /* ── Cleanup ────────────────────────────────────────────────────────── */
     printf("\nShutting down...\n");
 
-    Pa_StopStream(stream);
-    Pa_CloseStream(stream);
+    Pa_StopStream(g_stream);
+    Pa_CloseStream(g_stream);
     Pa_Terminate();
 
     /* Wake up worker thread so it can exit */
