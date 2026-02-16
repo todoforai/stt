@@ -33,7 +33,9 @@ Trailing phrases trigger actions instead of being typed:
 |--------|--------|
 | `do it now` | Press Enter |
 | `press enter` | Press Enter |
+| `press tab` | Press Tab |
 | `interrupt it` | Press Ctrl+C |
+| `cancel it` | Press Ctrl+C |
 
 ## Controls
 
