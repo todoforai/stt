@@ -31,9 +31,9 @@ Trailing phrases trigger actions instead of being typed:
 
 | Phrase | Action |
 |--------|--------|
-| `do it now`, `execute` | Press Enter |
-| `press enter`, `new line` | Press Enter |
-| `interrupt it`, `stop it` | Press Ctrl+C |
+| `do it now` | Press Enter |
+| `press enter` | Press Enter |
+| `interrupt it` | Press Ctrl+C |
 
 ## Controls
 
