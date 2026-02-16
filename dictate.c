@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <linux/input.h>
@@ -125,6 +126,33 @@ static int    g_audio_buf_len = 0;
 
 /* Path prefix for models (set from argv[0] location) */
 static char g_basedir[4096];
+
+/* ── Overlay indicator ────────────────────────────────────────────────────── */
+
+static pid_t g_overlay_pid = 0;
+
+static void overlay_start(void) {
+    g_overlay_pid = fork();
+    if (g_overlay_pid == 0) {
+        char path[4112];
+        snprintf(path, sizeof(path), "%s/overlay", g_basedir);
+        execl(path, "overlay", NULL);
+        _exit(1);
+    }
+}
+
+static void overlay_toggle(void) {
+    if (g_overlay_pid > 0)
+        kill(g_overlay_pid, SIGUSR1);
+}
+
+static void overlay_stop(void) {
+    if (g_overlay_pid > 0) {
+        kill(g_overlay_pid, SIGTERM);
+        waitpid(g_overlay_pid, NULL, 0);
+        g_overlay_pid = 0;
+    }
+}
 
 /* ── Voice commands (trailing phrase → key press) ─────────────────────────── */
 
@@ -362,9 +390,11 @@ static void on_toggle(int sig) {
         /* Reset VAD state so we start clean on resume */
         SherpaOnnxVoiceActivityDetectorReset(g_vad);
         g_audio_buf_len = 0;
+        overlay_toggle();
         fprintf(stderr, "\r\033[K  [PAUSED — press F9 to resume]\n");
     } else {
         Pa_StartStream(g_stream);
+        overlay_toggle();
         fprintf(stderr, "\r\033[K  [RESUMED — listening...]\n");
     }
 }
@@ -506,6 +536,8 @@ int main(int argc, char *argv[]) {
     printf("==================================================\n");
     printf("\n  Listening...\n\n");
 
+    overlay_start();
+
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGUSR1, on_toggle);
@@ -527,6 +559,7 @@ int main(int argc, char *argv[]) {
     pthread_mutex_unlock(&g_queue.mutex);
     pthread_join(worker, NULL);
 
+    overlay_stop();
     queue_destroy(&g_queue);
     typer_cleanup();
     SherpaOnnxDestroyVoiceActivityDetector(g_vad);

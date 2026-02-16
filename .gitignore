@@ -1,3 +1,7 @@
+models/
+libs/
+dictate
+overlay
 __pycache__/
 *.pyc
 *.egg-info/
