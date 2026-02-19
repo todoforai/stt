@@ -536,11 +536,11 @@ int main(int argc, char *argv[]) {
     printf("==================================================\n");
     printf("\n  Listening...\n\n");
 
-    overlay_start();
-
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGUSR1, on_toggle);
+
+    overlay_start();
 
     while (g_running) {
         Pa_Sleep(100);

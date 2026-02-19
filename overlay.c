@@ -18,6 +18,7 @@
 #include <math.h>
 #include <signal.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <time.h>
 
 #define BAR_N      9
@@ -49,6 +50,8 @@ static XRenderColor rgba(double r, double g, double b, double a) {
 }
 
 int main(void) {
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+
     Display *dpy = XOpenDisplay(NULL);
     if (!dpy) return 1;
 
