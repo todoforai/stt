@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Scribe v2 Realtime — Full vs VAD-gated</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; max-width: 1000px; margin: 1.5rem auto; padding: 0 1rem; }
+    button, select { font: inherit; padding: .5em .8em; margin: .2em 0; }
+    .row { display: flex; gap: .6em; align-items: center; flex-wrap: wrap; }
+    .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem; }
+    .col h3 { margin: 0 0 .3em; }
+    .partial { color: #888; min-height: 1.4em; font-style: italic; }
+    .final { white-space: pre-wrap; background: #f6f7f8; padding: .8em; border-radius: 6px; min-height: 6em; }
+    .meta { font: 12px monospace; color: #555; margin-top: .4em; }
+    #log { white-space: pre-wrap; background: #111; color: #0f0; padding: .8em; border-radius: 6px;
+           min-height: 6em; max-height: 320px; overflow-y: auto; font: 12px monospace; margin-top: 1rem; }
+    .dot { width: .7em; height: .7em; border-radius: 50%; background: #ccc; display: inline-block; }
+    .dot.on { background: #e0245e; animation: pulse 1s infinite; }
+    @keyframes pulse { 50% { opacity: .3; } }
+    #vadBox { display: flex; align-items: center; gap: .6em; padding: .6em .9em; border-radius: 8px;
+              background: #eee; font-weight: 600; transition: background .1s; }
+    #vadBox.talking { background: #d7f5dd; }
+    #vadBox.talking #vadLabel { color: #15803d; }
+    #vadLabel { color: #888; }
+    #vadBar { flex: 1; height: 8px; background: #ddd; border-radius: 4px; overflow: hidden; }
+    #vadFill { height: 100%; width: 0%; background: #22c55e; transition: width .08s; }
+    .tagA { color: #1d4ed8; } .tagB { color: #15803d; }
+  </style>
+</head>
+<body>
+  <h1>Scribe v2 Realtime — Full vs VAD-gated</h1>
+  <p>MVP harness for the voice-support pipeline (VAD → STT → LLM → TTS — see <code>README.md</code>).
+     Two Scribe WebSockets, same mic. <b class="tagA">A = full stream</b> (everything sent).
+     <b class="tagB">B = VAD-gated</b> (only sent while local Silero VAD detects speech).
+     Compare transcript equality + bytes sent (cost proxy). Default language: Hungarian.</p>
+
+  <div id="vadBox">
+    <span class="dot" id="vadDot"></span>
+    <span id="vadLabel">VAD: idle</span>
+    <div id="vadBar"><div id="vadFill"></div></div>
+  </div>
+
+  <div class="row" style="margin-top:.8em">
+    <label>Language:
+      <select id="lang">
+        <option value="hu" selected>Hungarian (hu)</option>
+        <option value="en">English (en)</option>
+        <option value="">auto-detect</option>
+      </select>
+    </label>
+    <button id="start">● Start</button>
+    <button id="stop" disabled>■ Stop</button>
+    <span class="dot" id="dot"></span>
+  </div>
+
+  <div class="cols">
+    <div class="col">
+      <h3 class="tagA">A — Full stream</h3>
+      <div class="partial" id="partialA"></div>
+      <div class="final" id="finalA"></div>
+      <div class="meta" id="metaA">sent: 0.0s audio · commits: 0</div>
+    </div>
+    <div class="col">
+      <h3 class="tagB">B — VAD-gated</h3>
+      <div class="partial" id="partialB"></div>
+      <div class="final" id="finalB"></div>
+      <div class="meta" id="metaB">sent: 0.0s audio · commits: 0</div>
+    </div>
+  </div>
+
+  <h3>Log</h3>
+  <div id="log"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js"></script>
+<script type="module">
+const $ = id => document.getElementById(id);
+const t0 = performance.now();
+const ts = () => ((performance.now() - t0) / 1000).toFixed(2).padStart(6) + 's';
+const log = (...a) => { $('log').textContent += ts() + '  ' + a.join(' ') + '\n'; $('log').scrollTop = 1e9; console.log(...a); };
+
+let audioCtx, node, stream, vad;
+let speaking = false;            // local VAD state → gates channel B
+
+// One Scribe channel (A or B). `gated` = only send while VAD says speech.
+const PREROLL_CHUNKS = 4;   // ~1s kept before VAD fires — covers the onset delay, not bloated
+
+class Channel {
+  constructor(tag, gated) {
+    this.tag = tag; this.gated = gated;
+    this.ws = null; this.sentSamples = 0; this.commits = 0;
+    this.preroll = []; this.wasSpeaking = false; this.outbox = [];
+  }
+  async open(lang) {
+    this.lang = lang;
+    const { token } = await (await fetch('/token', { method: 'POST' })).json();
+    // A: server-side VAD commits on silence. B: manual — we commit via local VAD's onSpeechEnd.
+    const p = new URLSearchParams({
+      model_id: 'scribe_v2_realtime',
+      commit_strategy: this.gated ? 'manual' : 'vad',
+      audio_format: 'pcm_16000', token,
+    });
+    if (!this.gated) p.set('vad_silence_threshold_ms', '200');
+    if (lang) p.set('language_code', lang);
+    this.ws = new WebSocket(`wss://api.elevenlabs.io/v1/speech-to-text/realtime?${p}`);
+    this.ws.onopen  = () => { log(`[${this.tag}] WS open`); const q = this.outbox; this.outbox = []; for (const it of q) it === 'commit' ? this._commit() : this._emit(it); };
+    this.ws.onerror = e => log(`[${this.tag}] WS error`, e.message || '');
+    this.ws.onclose = e => log(`[${this.tag}] WS closed`, e.code);   // idle close is fine — we lazily reopen on next speech
+    this.ws.onmessage = ev => {
+      const m = JSON.parse(ev.data);
+      const L = this.tag;
+      if (m.message_type === 'partial_transcript') {
+        $('partial' + L).textContent = m.text || '';
+      } else if (m.message_type.startsWith('committed')) {
+        if (m.text) {
+          this.commits++;
+          log(`[${L}] ✓ COMMIT:`, JSON.stringify(m.text));
+          $('final' + L).textContent += m.text + ' ';
+          $('partial' + L).textContent = '';
+          this.updateMeta();
+        }
+      } else if (m.message_type === 'session_started') {
+        log(`[${L}] session_started`);
+      }
+    };
+  }
+  _emit(i16) {
+    if (!this.ws || this.ws.readyState !== 1) { this.outbox.push(i16); return; }  // buffer until (re)connected
+    let bin = ''; const bytes = new Uint8Array(i16.buffer);
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    this.ws.send(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: btoa(bin) }));
+    this.sentSamples += i16.length;
+    this.updateMeta();
+  }
+  send(i16) {
+    if (!this.gated) {                              // channel A: always streaming
+      if (this.ws?.readyState === 1) this._emit(i16);
+      return;
+    }
+    // channel B: keep a rolling pre-roll buffer; flush it when speech starts.
+    if (!speaking) {
+      this.preroll.push(i16);
+      if (this.preroll.length > PREROLL_CHUNKS) this.preroll.shift();
+      this.wasSpeaking = false;
+      return;
+    }
+    if (!this.wasSpeaking) {                         // just transitioned to speaking
+      // Lazy reconnect: idle let the WS close; reopen now that the user speaks.
+      if (!this.closed && (!this.ws || this.ws.readyState >= 2)) { log(`[${this.tag}] reopen on speech`); this.open(this.lang); }
+      for (const c of this.preroll) this._emit(c);   // pre-roll first (saves word starts; buffered if connecting)
+      this.preroll = [];
+      this.wasSpeaking = true;
+    }
+    this._emit(i16);
+  }
+  _commit() {
+    this.ws.send(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: '', commit: true }));
+    log(`[${this.tag}] → manual commit`);
+  }
+  commit() {                                       // manual commit (channel B, on VAD speech-end)
+    if (this.ws?.readyState === 1) this._commit();
+    else this.outbox.push('commit');               // queued behind buffered audio if still connecting
+  }
+  updateMeta() { $('meta' + this.tag).textContent =
+    `sent: ${(this.sentSamples / 16000).toFixed(1)}s audio · commits: ${this.commits}`; }
+  close() { this.closed = true; this.ws?.close(); }
+}
+
+let chA, chB;
+
+async function startVad() {
+  const d = window.vad, CDN = 'https://cdn.jsdelivr.net/npm/';
+  vad = await d.MicVAD.new({
+    model: 'v5',
+    onnxWASMBasePath: `${CDN}onnxruntime-web@1.22.0/dist/`,
+    baseAssetPath:    `${CDN}@ricky0123/vad-web@0.0.29/dist/`,
+    // Looser, so it doesn't cut WITHIN a sentence (mid-sentence pauses, soft word-endings):
+    positiveSpeechThreshold: 0.5,
+    negativeSpeechThreshold: 0.25,   // lower = harder to "exit" speech → keeps soft endings
+    minSpeechFrames: 4,
+    redemptionFrames: 24,            // ~0.77s of silence tolerated before ending (was ~0.25s)
+    preSpeechPadFrames: 10,          // keep ~0.3s before onset → no clipped word starts
+    onFrameProcessed: probs => { $('vadFill').style.width = (probs.isSpeech * 100).toFixed(0) + '%'; },
+    onSpeechStart: () => {
+      speaking = true;
+      $('vadBox').classList.add('talking'); $('vadDot').classList.add('on');
+      $('vadLabel').textContent = 'VAD: NOW TALKING';
+      log('VAD ▶ START');
+    },
+    onSpeechEnd: () => {
+      speaking = false;
+      $('vadBox').classList.remove('talking'); $('vadDot').classList.remove('on');
+      $('vadLabel').textContent = 'VAD: idle';
+      log('VAD ■ END');
+      chB?.commit();          // local VAD decides the boundary → tell Scribe to commit
+    },
+  });
+  vad.start();
+  log('Local VAD running (Silero v5).');
+}
+
+async function start() {
+  $('start').disabled = true;
+  try {
+    const lang = $('lang').value;
+    chA = new Channel('A', false);   // full
+    chB = new Channel('B', true);    // VAD-gated
+    log('Opening 2 Scribe channels…');
+    await Promise.all([chA.open(lang), chB.open(lang)]);
+    $('dot').classList.add('on'); $('stop').disabled = false;
+
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true } });
+    audioCtx = new AudioContext({ sampleRate: 16000 });
+    const src = audioCtx.createMediaStreamSource(stream);
+    node = audioCtx.createScriptProcessor(4096, 1, 1);
+    node.onaudioprocess = e => {
+      const f32 = e.inputBuffer.getChannelData(0);
+      const i16 = new Int16Array(f32.length);
+      for (let i = 0; i < f32.length; i++) i16[i] = Math.max(-1, Math.min(1, f32[i])) * 32767;
+      chA.send(i16);
+      chB.send(i16);
+    };
+    src.connect(node); node.connect(audioCtx.destination);
+    await startVad();
+    log('Streaming @16kHz to both channels. Speak (HU)!');
+  } catch (e) { log('ERROR:', e.message); cleanup(); }
+}
+
+function cleanup() {
+  $('dot').classList.remove('on'); $('start').disabled = false; $('stop').disabled = true;
+  node?.disconnect(); audioCtx?.close(); stream?.getTracks().forEach(t => t.stop());
+  vad?.pause(); vad = null; speaking = false;
+  $('vadBox').classList.remove('talking'); $('vadDot').classList.remove('on'); $('vadLabel').textContent = 'VAD: idle';
+  node = audioCtx = stream = null;
+}
+
+function stop() {
+  chA?.close(); chB?.close(); cleanup();
+  if (chA && chB) {
+    const eq = $('finalA').textContent.trim() === $('finalB').textContent.trim();
+    log(`RESULT: transcripts ${eq ? 'IDENTICAL ✓' : 'DIFFER ✗'} · A sent ${(chA.sentSamples/16000).toFixed(1)}s, B sent ${(chB.sentSamples/16000).toFixed(1)}s (B = ${(100*chB.sentSamples/(chA.sentSamples||1)).toFixed(0)}% of A)`);
+  }
+}
+
+$('start').onclick = start;
+$('stop').onclick = stop;
+</script>
+</body>
+</html>
