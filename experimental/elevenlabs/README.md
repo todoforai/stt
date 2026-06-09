@@ -21,10 +21,11 @@ talking and know **exactly how much of our answer was already heard**.
 3. **LLM** (Anthropic Haiku) — `(systemPrompt, committedTranscript)` → reply,
    **streamed** (SSE) so TTS can start on the first sentence.
 4. **TTS** (Piper — local, free, has HU; ElevenLabs optional) — text → audio.
-   **Two-phase:** sentence 1 is synthesized + played the moment its boundary
-   arrives in the stream (low first-audio latency); the rest is collected and
-   synthesized in **one** call (better prosody than per-sentence) in parallel,
-   so it's ready by the time sentence 1 finishes — no gap.
+   **Streamed sentence-by-sentence:** sentence 1 plays the moment its boundary
+   arrives (low first-audio latency); each later sentence is synthesized **one
+   ahead** while the current one plays, so the next clip is ready when the
+   current ends (no growing gap on long answers) and playback is strictly
+   one-at-a-time (never two voices at once).
 
 ## Interruption (the hard requirement)
 
@@ -76,42 +77,38 @@ Findings so far:
   B **lazily reopens on the next speech** and buffers audio + the commit in an
   `outbox` until connected — so nothing (including the turn-closing commit) is lost.
 
-## Portability target
+## Portability
 
-Wrap the four stages behind small interfaces so each is swappable:
+Framework-free vanilla module; endpoints (`llmUrl`, `sttTokenUrl`, `sttUrl`, …) are
+constructor options. LLM and TTS are already pluggable (pass `llm` / `tts`); VAD+STT
+(Silero+Scribe) are still wired into the orchestrator — extracting them behind an
+interface is the remaining portability step:
 
 ```
-VAD     : onSpeechStart / onSpeechEnd / isSpeaking      (Silero today)
-STT     : start() / sendAudio() / commit() / onCommit   (Scribe today)
-LLM     : stream(system, text) → tokens / abort()       (Haiku today)
-TTS     : speak(text) / stop() / spokenSoFar() → string (Piper today; proportional estimate)
+VAD : onSpeechStart / onSpeechEnd / isSpeaking      (Silero)
+STT : start() / sendAudio() / commit() / onCommit   (Scribe)
+LLM : stream(system, text) → tokens / abort()       (Haiku, pluggable)
+TTS : speak(text) / stop() / spokenSoFar() → string (Piper, pluggable)
 ```
-
-The orchestrator is just the state machine above plus the barge-in wiring.
-Keep it framework-free (vanilla JS module + a tiny token server) so it drops
-into any page.
 
 ## Files
 
-- `index.html` — **the voice-agent demo** (full VAD → STT → LLM → TTS loop with barge-in).
-- `voice-agent.js` — the portable agent module (the 4 stages + barge-in state machine).
-- `token-server.py` — keeps keys server-side. Serves the demo + `/token` (Scribe) + `/llm`
-  (CLIProxyAPI proxy, Haiku 4.5).
-- `scribe-realtime.html` — A/B VAD-gating comparison harness (kept; validated cost ↓ = equal accuracy).
-- `NOTES.md` — Scribe realtime auth, measured billing, tuning notes.
+- `index.html` — the voice-agent demo (full loop with barge-in).
+- `voice-agent.js` — the portable agent module (4 stages + barge-in state machine).
+- `scribe-realtime.html` — A/B VAD-gating harness (validated cost ↓ = equal accuracy).
+- `NOTES.md` — Scribe auth, measured billing, tuning notes.
 
 ## Run the demo
 
-```bash
-ELEVENLABS_API_KEY=sk_... CLIPROXYAPI_API_KEY=sk_... python3 token-server.py
-# open http://localhost:8770/
-```
+Keys stay server-side: the demo gets the LLM + STT token from the **backend**
+(`/api/v1/llm`, `/api/v1/stt/token`). Set `tfa_api_key` in localStorage for `X-API-Key`,
+then serve these static files with any web server (e.g. `npx serve`) and open it — the
+backend must be up on `:4000` (override via the `baseUrl` constructor option).
 
-The LLM goes through CLIProxyAPI (free via subscription), model **Haiku 4.5** (~1.2s to
-first token). The `/llm` proxy sends a `User-Agent: claude-cli/...` header: without it the
-proxy "cloaks" `claude-*` requests — prepending a "You are Claude Code" system prompt so
-the model refuses custom personas. Posing as the official CLI skips cloaking, so our
-system prompt reaches Anthropic unchanged.
+Endpoints are constructor options (`baseUrl`, `llmUrl`, `sttTokenUrl`, `sttUrl`, …) so the module drops
+into any product without editing source. LLM: CLIProxyAPI **Haiku 4.5** (free via
+subscription, ~1.2s to first token); the backend route poses as `claude-cli` to skip the
+proxy's persona-cloaking so our system prompt reaches Anthropic unchanged.
 
 ## Status
 
@@ -120,9 +117,12 @@ system prompt reaches Anthropic unchanged.
 - [x] Manual commit driven by VAD speech-end
 - [x] Pre-roll buffer + lazy reconnect (no clipped starts, survives long silences)
 - [x] A/B harness proving cost ↓ with equal accuracy
-- [x] LLM stage (CLIProxyAPI Haiku 4.5, via `/llm` proxy, `claude-cli` UA to skip cloaking)
+- [x] LLM stage (CLIProxyAPI Haiku 4.5, via backend `/api/v1/llm`, `claude-cli` UA to skip cloaking)
 - [x] Barge-in: stop TTS + abort LLM on VAD speech-start, record heard prefix
 - [x] Voice-agent demo wiring the 4 stages (`index.html` + `voice-agent.js`)
 - [x] TTS stage: Piper (local, HU) via WASM; whole-WAV playback, proportional `spokenSoFar`
-- [x] Stream the LLM (SSE) and start TTS on the first sentence (two-phase: sentence 1 now, rest in one parallel synth — no gap)
+- [x] Stream the LLM (SSE) and speak sentence-by-sentence (synth one ahead, strict one-at-a-time playback — minimal gaps)
+- [x] Endpoints as constructor options (`llmUrl`/`sttTokenUrl`/`sttUrl`/…); STT token via backend `/api/v1/stt/token`
+- [x] Built-in `create_task` tool (T/1 → command to high-level AI); host supplies only `onTask`
 - [ ] Exact `spokenSoFar` (char-level alignment) — needs ElevenLabs TTS; Piper gives only proportional estimate
+- [ ] Pluggable STT interface (VAD+Scribe still wired into the orchestrator; LLM/TTS already swappable)
