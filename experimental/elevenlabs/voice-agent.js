@@ -7,15 +7,22 @@
 //   text = vad+stt  →  history.push(user:text)  →  llm STREAMS the answer
 //   →  tts.speak(stream)   (barge-in stops tts + aborts llm, and records what was heard)
 //
-// First-sentence latency: `tts.speak` takes an async iterator of text deltas. It
-// synthesizes the FIRST sentence as soon as its boundary arrives and starts playing,
-// while the REST is collected from the stream and synthesized in ONE call (better
-// prosody than per-sentence, and ready by the time sentence 1 finishes playing).
+// First-sentence latency: `tts.speak` takes an async iterator of text deltas. It synthesizes
+// the FIRST sentence as soon as its boundary arrives and starts playing, then streams the rest
+// sentence-by-sentence — synthesizing ONE sentence ahead while the current plays, so there's no
+// growing gap on long answers, and never two clips at once (see PiperTTS.speak).
 //
-// `llm` and `tts` are pluggable. Defaults: llm → /llm proxy (Haiku, SSE), tts → Piper (local WASM, HU).
+// `llm` and `tts` are pluggable; endpoints/knobs (llmUrl, tokenUrl, sttUrl, maxTokens,
+// vadOptions, …) are constructor options. Defaults: llm → backend /llm SSE proxy (Haiku),
+// tts → Piper (local WASM, HU), stt → ElevenLabs Scribe realtime.
 
 const CDN = 'https://cdn.jsdelivr.net/npm/';
 const PREROLL_CHUNKS = 4;   // ~1s kept before VAD fires, so word starts aren't clipped
+// Default endpoints (all overridable per-instance — see the constructor). Keys stay
+// server-side: the LLM + STT-token routes live on your backend, under `BASE_URL`.
+const BASE_URL = 'http://localhost:4000/api/v1';
+const STT_URL = 'wss://api.elevenlabs.io/v1/speech-to-text/realtime';
+const STT_MODEL = 'scribe_v2_realtime';
 
 // Built-in `create_task` tool: forward a command to a high-level AI. Generic/portable, so it
 // lives here — the host only supplies the `run` via the `onTask` option (no need to restate
@@ -33,13 +40,22 @@ export class VoiceAgent {
   // to the high-level AI) without redefining it per host — its `run` is your callback.
   // `keyterms`: domain words to bias STT towards (names, jargon it would otherwise
   // mishear). Max 50, ≤20 chars each; adds a 20% premium to the transcription cost.
-  constructor({ sysmsg = '', llm, llmApiKey = '', tts = defaultTTS, sttLang = 'hu', tools = {}, onTask, keyterms = [], onEvent = () => {} } = {}) {
+  // Endpoints/knobs are options so the module drops into any product without editing source:
+  //   `baseUrl` — your backend's `/api/v1` base; the SSE-LLM + STT-token routes hang off it
+  //     (keys stay server-side). `llmUrl`/`tokenUrl` override the individual routes if needed.
+  //   `sttUrl`/`sttModel` — STT realtime socket + model id (ElevenLabs Scribe by default).
+  //   `maxTokens`, `preroll` (chunks kept before VAD fires), `vadOptions` (Silero overrides).
+  constructor({ sysmsg = '', llm, llmApiKey = '', baseUrl = BASE_URL, llmUrl = `${baseUrl}/llm`, maxTokens = 1024,
+                tts = defaultTTS, sttLang = 'hu', tokenUrl = `${baseUrl}/stt/token`, sttUrl = STT_URL, sttModel = STT_MODEL,
+                tools = {}, onTask, keyterms = [], preroll = PREROLL_CHUNKS, vadOptions = {}, onEvent = () => {} } = {}) {
     this.sysmsg = sysmsg; this.tts = tts; this.sttLang = sttLang; this.onEvent = onEvent;
+    this.apiKey = llmApiKey; this.tokenUrl = tokenUrl; this.sttUrl = sttUrl; this.sttModel = sttModel;
+    this.prerollMax = preroll; this.vadOptions = vadOptions;
     this.tools = { ...(onTask ? { create_task: { ...CREATE_TASK_TOOL, run: onTask } } : {}), ...tools };
     this.keyterms = keyterms.filter(k => k && k.length <= 20).slice(0, 50);
     const defs = Object.entries(this.tools).map(([name, t]) =>
       ({ name, description: t.description || '', input_schema: { type: 'object', properties: t.params || {} } }));
-    this.llm = llm || makeLLM(defs, llmApiKey);
+    this.llm = llm || makeLLM(defs, llmApiKey, llmUrl, maxTokens);
     this.history = [];
     this.state = 'idle';           // idle | listening | thinking | speaking
     this._abort = null;            // aborts the in-flight LLM
@@ -55,16 +71,11 @@ export class VoiceAgent {
     this._node.onaudioprocess = e => this._feed(e.inputBuffer.getChannelData(0));
     src.connect(this._node); this._node.connect(this._ctx.destination);
     await this._startVad();
-    // Don't talk to a backgrounded tab: stop TTS when hidden (the next turn speaks again
-    // when it's foreground). STT keeps running, so the user isn't cut off mid-sentence.
-    this._onHidden = () => { if (document.hidden) this.tts.stop?.(); };
-    document.addEventListener('visibilitychange', this._onHidden);
     this._set('listening');
   }
 
   stop() {
     this._closed = true; this._abort?.abort(); this.tts.stop?.();
-    document.removeEventListener('visibilitychange', this._onHidden);
     this._vad?.pause(); this._ws?.close();
     this._node?.disconnect(); this._ctx?.close(); this._stream?.getTracks().forEach(t => t.stop());
     this._set('idle');
@@ -160,6 +171,7 @@ export class VoiceAgent {
       baseAssetPath:    `${CDN}@ricky0123/vad-web@0.0.29/dist/`,
       positiveSpeechThreshold: 0.5, negativeSpeechThreshold: 0.25,
       minSpeechFrames: 4, redemptionFrames: 24, preSpeechPadFrames: 10,
+      ...this.vadOptions,                                       // host tuning overrides the defaults above
       onSpeechStart: () => { this._speaking = true; this.onEvent({ type: 'vad', active: true }); if (this.state === 'speaking') this._onBargeIn(); },
       onSpeechEnd:   () => { this._speaking = false; this.onEvent({ type: 'vad', active: false }); this._commit(); },
     });
@@ -168,12 +180,12 @@ export class VoiceAgent {
 
   // ── STT (Scribe, VAD-gated, manual commit, lazy reconnect) ──────────────
   async _openWs() {
-    const { token } = await (await fetch('/token', { method: 'POST' })).json();
-    const p = new URLSearchParams({ model_id: 'scribe_v2_realtime', commit_strategy: 'manual', audio_format: 'pcm_16000', token });
+    const { token } = await (await fetch(this.tokenUrl, { method: 'POST', headers: { 'X-API-Key': this.apiKey } })).json();
+    const p = new URLSearchParams({ model_id: this.sttModel, commit_strategy: 'manual', audio_format: 'pcm_16000', token });
     if (this.sttLang) p.set('language_code', this.sttLang);
     for (const k of this.keyterms) p.append('keyterms', k);   // repeated param, not comma-joined — bias STT towards domain terms
     this._sttStart = performance.now();                            // for elapsed timing of this STT turn
-    this._ws = new WebSocket(`wss://api.elevenlabs.io/v1/speech-to-text/realtime?${p}`);
+    this._ws = new WebSocket(`${this.sttUrl}?${p}`);
     this._ws.onopen = () => { const q = this._outbox; this._outbox = []; for (const it of q) it === 'commit' ? this._sendCommit() : this._sendAudio(it); };
     this._ws.onerror = ev => { this.onEvent({ type: 'error', error: 'STT socket error' }); console.error('STT ws error', ev); };
     this._ws.onclose  = ev => { if (ev.code !== 1000) { this.onEvent({ type: 'error', error: `STT closed ${ev.code}: ${ev.reason || 'no reason'}` }); console.error('STT ws closed', ev.code, ev.reason, 'clean:', ev.wasClean); } };
@@ -193,7 +205,7 @@ export class VoiceAgent {
   _feed(f32) {
     const i16 = new Int16Array(f32.length);
     for (let i = 0; i < f32.length; i++) i16[i] = Math.max(-1, Math.min(1, f32[i])) * 32767;
-    if (!this._speaking) { this._preroll.push(i16); if (this._preroll.length > PREROLL_CHUNKS) this._preroll.shift(); this._wasSpeaking = false; return; }
+    if (!this._speaking) { this._preroll.push(i16); if (this._preroll.length > this.prerollMax) this._preroll.shift(); this._wasSpeaking = false; return; }
     if (!this._wasSpeaking) {
       if (!this._closed && (!this._ws || this._ws.readyState >= 2)) this._openWs();
       for (const c of this._preroll) this._sendAudio(c); this._preroll = []; this._wasSpeaking = true;
@@ -209,19 +221,18 @@ export class VoiceAgent {
   _commit() { if (this._ws?.readyState === 1) this._sendCommit(); else this._outbox.push('commit'); }
 }
 
-// ── default LLM: Haiku straight from CLIProxyAPI (no Python /llm proxy), SSE-streamed ──
+// ── default LLM: backend /api/v1/llm SSE proxy (CLIProxyAPI Haiku, key server-side) ──
 //    Posts the native Anthropic Messages request and parses the native SSE: text_delta →
 //    { text }, tool_use content_block → { tool, args } (input_json_delta accumulated).
 //    The `claude-cli` User-Agent skips the proxy's cloaking so our system prompt + native
 //    tools reach the model unchanged (that's what gives real tool_use, not XML text).
 //    Throws on a non-OK response so the agent surfaces the error instead of speaking junk.
-const LLM_URL = 'http://localhost:4000/api/v1/llm';      // backend SSE route (CLIProxyAPI key stays server-side)
-function makeLLM(tools = [], apiKey = '') {
+function makeLLM(tools, apiKey, url, maxTokens) {
   return async function* (history, system, signal) {
-    const r = await fetch(LLM_URL, {
+    const r = await fetch(url, {
       method: 'POST', signal,
       headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
-      body: JSON.stringify({ system, messages: history, tools }),
+      body: JSON.stringify({ system, messages: history, tools, max_tokens: maxTokens }),
     });
     if (!r.ok) throw new Error((await r.json().catch(() => ({})))?.error || r.statusText);
 
