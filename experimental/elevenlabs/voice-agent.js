@@ -56,6 +56,11 @@ export class VoiceAgent {
 
   _set(s) { this.state = s; this.onEvent({ type: 'state', state: s }); }
 
+  // List the TTS voices for a picker (if the active TTS supports it): [{ id, name, language }].
+  listVoices() { return this.tts.voices ? this.tts.voices() : Promise.resolve([]); }
+  // Switch TTS voice (takes effect on the next utterance).
+  setVoice(voiceId) { this.tts.setVoice?.(voiceId); }
+
   // ── the loop ──────────────────────────────────────────────────────────
   // State drives everything the UI needs: listening = VAD/STT, thinking = LLM,
   // speaking = TTS. No separate 'stage'/'user' events — derive the pipeline from state.
@@ -254,9 +259,17 @@ function sentenceEnd(s) {
 //    Whole WAVs (no char timings) → on barge-in the heard prefix is estimated proportionally
 //    within the playing sentence. Voice: hu_HU-anna-medium.
 const CDN_PIPER = `${CDN}@mintplex-labs/piper-tts-web@1.0.4/dist/piper-tts-web.js`;
-class PiperTTS {
+export class PiperTTS {
   constructor(voiceId = 'hu_HU-anna-medium') { this.voiceId = voiceId; this._ctx = null; this._node = null; }
   async _tts() { return this._lib ??= await import(/* @vite-ignore */ CDN_PIPER); }
+
+  // List installable Piper voices: [{ id, name, language }]. `id` is what you pass as
+  // `voiceId` (lib calls it `key`). Lets the UI build a voice picker; switch with setVoice.
+  async voices() {
+    const list = await (await this._tts()).voices();              // [{ key, name, language: { code, … }, … }]
+    return list.map(v => ({ id: v.key, name: v.name || v.key, language: v.language?.code || v.language || '' }));
+  }
+  setVoice(voiceId) { this.voiceId = voiceId; }
 
   // Synthesize text → decoded AudioBuffer (the slow part; run it ahead of playback).
   async _synth(text, signal) {

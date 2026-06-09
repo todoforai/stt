@@ -84,6 +84,9 @@ Conversation so far:
         <option value="en">English (en)</option>
       </select>
     </label>
+    <label>Hang:
+      <select id="voice"><option>betöltés…</option></select>
+    </label>
     <button id="start">● Start</button>
     <button id="stop" disabled>■ Stop</button>
     <span id="state"><span class="dot"></span><span id="stateLabel">idle</span></span>
@@ -116,10 +119,13 @@ Conversation so far:
   { "imports": { "onnxruntime-web": "https://esm.sh/onnxruntime-web@1.18.0" } }
   </script>
   <script type="module">
-    import { VoiceAgent } from './voice-agent.js';
+    import { VoiceAgent, PiperTTS } from './voice-agent.js';
 
     const $ = id => document.getElementById(id);
     const chat = $('chat');
+    // One shared Piper TTS: list its voices for the picker (before Start), and hand it to the
+    // agent so the chosen voice is what speaks. setVoice() takes effect on the next utterance.
+    const tts = new PiperTTS();
     let agent = null;
 
     // TODOforAI API key (X-API-Key) for the backend /api/v1/llm route. Use a localStorage
@@ -288,10 +294,33 @@ Conversation so far:
       } catch (e) { $('keytermsOut').textContent = '⚠️ keyterms hiba: ' + e.message; }
     };
 
+    // ── Voice picker ─────────────────────────────────────────────────────────
+    // Fill #voice with Piper voices for the chosen language (matched by the language-code
+    // prefix, e.g. hu → hu_HU-*), so it's not all 124. Default-select the active voiceId.
+    let _allVoices = null;
+    async function fillVoices() {
+      const lang = $('lang').value;
+      _allVoices ??= await tts.voices().catch(() => []);                 // [{ id, name, language }]
+      const matching = _allVoices.filter(v => v.language.toLowerCase().startsWith(lang));
+      const list = matching.length ? matching : _allVoices;             // fall back to all if none for this lang
+      $('voice').innerHTML = '';
+      for (const v of list) {
+        const o = document.createElement('option');
+        o.value = v.id; o.textContent = `${v.name} (${v.language})`;
+        if (v.id === tts.voiceId) o.selected = true;
+        $('voice').appendChild(o);
+      }
+      if (!list.some(v => v.id === tts.voiceId)) tts.setVoice($('voice').value);   // keep tts in sync with the shown default
+    }
+    fillVoices();
+    $('lang').addEventListener('change', fillVoices);
+    $('voice').addEventListener('change', () => tts.setVoice($('voice').value));
+
     $('start').onclick = async () => {
       const lang = $('lang').value;
+      tts.setVoice($('voice').value);
       const keyterms = await buildKeyterms(lang);
-      agent = new VoiceAgent({ sysmsg: buildSysmsg(lang), sttLang: lang, tools: TOOLS, keyterms, llmApiKey: LLM_API_KEY, onEvent });
+      agent = new VoiceAgent({ sysmsg: buildSysmsg(lang), sttLang: lang, tools: TOOLS, keyterms, tts, llmApiKey: LLM_API_KEY, onEvent });
       try {
         await agent.start();
         $('start').disabled = true; $('stop').disabled = false;
