@@ -87,6 +87,9 @@ Conversation so far:
     <label>Hang:
       <select id="voice"><option>betöltés…</option></select>
     </label>
+    <label>Mikrofon:
+      <select id="mic"><option value="">Alapértelmezett</option></select>
+    </label>
     <button id="start">● Start</button>
     <button id="stop" disabled>■ Stop</button>
     <span id="state"><span class="dot"></span><span id="stateLabel">idle</span></span>
@@ -128,9 +131,9 @@ Conversation so far:
     const tts = new PiperTTS();
     let agent = null;
 
-    // TODOforAI API key (X-API-Key) for the backend /api/v1/llm route. Use a localStorage
-    // override so the key isn't committed: localStorage.setItem('tfa_api_key', 'tfa_…').
-    const LLM_API_KEY = localStorage.getItem('tfa_api_key') || '';
+    // TODOforAI API key (X-API-Key) for the backend /api/v1/{llm,stt/token} routes. Use a
+    // localStorage override so the key isn't committed: localStorage.setItem('tfa_api_key', 'tfa_…').
+    const API_KEY = localStorage.getItem('tfa_api_key') || '';
 
     // ── The conversation the voice agent communicates about (a support case). ──
     // `tool` rows are a tool call + its result. Rendered read-only in #seedView,
@@ -275,14 +278,9 @@ Conversation so far:
       return [...fixed, ...auto];
     }
 
-    // The one tool the voice agent can call: create a task from the conversation.
-    const TOOLS = {
-      create_task: {
-        description: 'Call when the user asks you to act on something (create a task / to-do / next step). Formulate the next task from the conversation. After calling, confirm it out loud in one short sentence.',
-        params: { content: { type: 'string', description: 'The task to do, phrased clearly.' } },
-        run: ({ content }) => { console.log('create_task', content); return { ok: true }; },
-      },
-    };
+    // Forward a command to the high-level AI. The `create_task` tool itself lives in the
+    // VoiceAgent (portable); we just supply what to do with the task here.
+    const onTask = ({ content }) => { console.log('create_task', content); return { ok: true }; };
 
     // Preview what auto-keyterms extracts for the current language (no mic, no LLM).
     $('previewKeyterms').onclick = async () => {
@@ -316,13 +314,32 @@ Conversation so far:
     $('lang').addEventListener('change', fillVoices);
     $('voice').addEventListener('change', () => tts.setVoice($('voice').value));
 
+    // ── Mic picker ───────────────────────────────────────────────────────────
+    // Labels are only exposed after mic permission is granted, so this is empty-ish before the
+    // first Start and gets refilled after. Keeps the current selection if still present.
+    async function fillMics() {
+      const devs = await navigator.mediaDevices.enumerateDevices().catch(() => []);
+      const mics = devs.filter(d => d.kind === 'audioinput');
+      const cur = $('mic').value;
+      $('mic').innerHTML = '<option value="">Alapértelmezett</option>';
+      for (const m of mics) {
+        const o = document.createElement('option');
+        o.value = m.deviceId; o.textContent = m.label || 'Mikrofon';
+        if (m.deviceId === cur) o.selected = true;
+        $('mic').appendChild(o);
+      }
+    }
+    fillMics();
+    navigator.mediaDevices.addEventListener('devicechange', fillMics);   // hot-plug / unplug
+
     $('start').onclick = async () => {
       const lang = $('lang').value;
       tts.setVoice($('voice').value);
       const keyterms = await buildKeyterms(lang);
-      agent = new VoiceAgent({ sysmsg: buildSysmsg(lang), sttLang: lang, tools: TOOLS, keyterms, tts, llmApiKey: LLM_API_KEY, onEvent });
+      agent = new VoiceAgent({ sysmsg: buildSysmsg(lang), sttLang: lang, onTask, keyterms, tts, apiKey: API_KEY, onEvent });
       try {
-        await agent.start();
+        await agent.start($('mic').value);                               // chosen mic, or '' = default
+        await fillMics();                                                // labels are available now → refill
         $('start').disabled = true; $('stop').disabled = false;
         $('sysmsg').disabled = $('lang').disabled = true;
       } catch (err) { alert('Mikrofon / indítás hiba: ' + err.message); agent = null; }

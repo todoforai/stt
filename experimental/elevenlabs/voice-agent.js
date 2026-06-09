@@ -12,7 +12,7 @@
 // sentence-by-sentence — synthesizing ONE sentence ahead while the current plays, so there's no
 // growing gap on long answers, and never two clips at once (see PiperTTS.speak).
 //
-// `llm` and `tts` are pluggable; endpoints/knobs (llmUrl, tokenUrl, sttUrl, maxTokens,
+// `llm` and `tts` are pluggable; endpoints/knobs (llmUrl, sttTokenUrl, sttUrl, maxTokens,
 // vadOptions, …) are constructor options. Defaults: llm → backend /llm SSE proxy (Haiku),
 // tts → Piper (local WASM, HU), stt → ElevenLabs Scribe realtime.
 
@@ -41,30 +41,35 @@ export class VoiceAgent {
   // `keyterms`: domain words to bias STT towards (names, jargon it would otherwise
   // mishear). Max 50, ≤20 chars each; adds a 20% premium to the transcription cost.
   // Endpoints/knobs are options so the module drops into any product without editing source:
-  //   `baseUrl` — your backend's `/api/v1` base; the SSE-LLM + STT-token routes hang off it
-  //     (keys stay server-side). `llmUrl`/`tokenUrl` override the individual routes if needed.
+  //   `baseUrl` — your backend's `/api/v1` base; the SSE-LLM + STT-token routes hang off it.
+  //     `apiKey` (X-API-Key) authenticates both — keys stay server-side behind them.
+  //     `llmUrl`/`sttTokenUrl` override the individual routes if needed.
   //   `sttUrl`/`sttModel` — STT realtime socket + model id (ElevenLabs Scribe by default).
   //   `maxTokens`, `preroll` (chunks kept before VAD fires), `vadOptions` (Silero overrides).
-  constructor({ sysmsg = '', llm, llmApiKey = '', baseUrl = BASE_URL, llmUrl = `${baseUrl}/llm`, maxTokens = 1024,
-                tts = defaultTTS, sttLang = 'hu', tokenUrl = `${baseUrl}/stt/token`, sttUrl = STT_URL, sttModel = STT_MODEL,
+  constructor({ sysmsg = '', llm, apiKey = '', baseUrl = BASE_URL, llmUrl = `${baseUrl}/llm`, maxTokens = 1024,
+                tts = defaultTTS, sttLang = 'hu', micDeviceId = '', sttTokenUrl = `${baseUrl}/stt/token`, sttUrl = STT_URL, sttModel = STT_MODEL,
                 tools = {}, onTask, keyterms = [], preroll = PREROLL_CHUNKS, vadOptions = {}, onEvent = () => {} } = {}) {
     this.sysmsg = sysmsg; this.tts = tts; this.sttLang = sttLang; this.onEvent = onEvent;
-    this.apiKey = llmApiKey; this.tokenUrl = tokenUrl; this.sttUrl = sttUrl; this.sttModel = sttModel;
-    this.prerollMax = preroll; this.vadOptions = vadOptions;
+    this.apiKey = apiKey; this.sttTokenUrl = sttTokenUrl; this.sttUrl = sttUrl; this.sttModel = sttModel;
+    this.micDeviceId = micDeviceId; this.prerollMax = preroll; this.vadOptions = vadOptions;
     this.tools = { ...(onTask ? { create_task: { ...CREATE_TASK_TOOL, run: onTask } } : {}), ...tools };
     this.keyterms = keyterms.filter(k => k && k.length <= 20).slice(0, 50);
     const defs = Object.entries(this.tools).map(([name, t]) =>
       ({ name, description: t.description || '', input_schema: { type: 'object', properties: t.params || {} } }));
-    this.llm = llm || makeLLM(defs, llmApiKey, llmUrl, maxTokens);
+    this.llm = llm || makeLLM(defs, apiKey, llmUrl, maxTokens);
     this.history = [];
     this.state = 'idle';           // idle | listening | thinking | speaking
     this._abort = null;            // aborts the in-flight LLM
     this._ws = null; this._preroll = []; this._wasSpeaking = false; this._outbox = []; this._closed = false;
   }
 
-  async start() {
+  // `deviceId` pins the mic to listen on — enumerate inputs host-side via
+  // navigator.mediaDevices.enumerateDevices() and pass the chosen audioinput's deviceId; omit
+  // for the browser default. Start-time choice — switching means stop() + start(id).
+  async start(deviceId = this.micDeviceId) {
     this._closed = false;
-    this._stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true } });
+    const audio = { channelCount: 1, echoCancellation: true, ...(deviceId ? { deviceId: { exact: deviceId } } : {}) };
+    this._stream = await navigator.mediaDevices.getUserMedia({ audio });
     this._ctx = new AudioContext({ sampleRate: 16000 });
     const src = this._ctx.createMediaStreamSource(this._stream);
     this._node = this._ctx.createScriptProcessor(4096, 1, 1);
@@ -93,23 +98,28 @@ export class VoiceAgent {
   // speaking = TTS. No separate 'stage'/'user' events — derive the pipeline from state.
   async _onUserTurn(text) {
     if (!text.trim()) return;
-    // Serialize turns: abort any in-flight LLM + stop any playing TTS before starting a new
-    // one. Without this, a second `committed` transcript spawns a parallel turn → overlapping
-    // (double/triple) TTS and chat bubbles.
+    // Serialize turns. Abort + stop the in-flight turn, then WAIT for it to settle — recording
+    // its heard prefix into history — BEFORE pushing the new user message. This keeps history
+    // chronological (…, assistant-heard-so-far, user-new) and prevents parallel TTS/LLM. Without
+    // the await, a barge-in's heard prefix is either lost or lands after the next user message.
     this._abort?.abort();
     this.tts.stop?.();
-    this.history.push({ role: 'user', content: text });
+    await this._turn?.catch(() => {});
 
+    this.history.push({ role: 'user', content: text });
     this._set('thinking');                          // LLM stage
     this._abort = new AbortController();
-    const signal = this._abort.signal;
+    await (this._turn = this._speakTurn(this._abort.signal));
+  }
 
-    // Tap the LLM stream once: yield speech text to TTS, set aside any tool call for
-    // after we finish speaking. The first delta flips us to 'speaking', and we accumulate
-    // the full answer to report heard-vs-unheard on barge-in.
-    // NOTE: `this.llm(...)` returns a lazy async generator — its fetch fires only when the
-    // consumer (tts.speak) first pulls from `tapped`, by which point any prior turn's signal
-    // is already aborted above. This is what prevents parallel LLM streams; keep llm lazy.
+  // One assistant turn: stream the LLM → TTS, then record what was actually HEARD (the barge-in
+  // prefix, not the full generated answer) and run any chosen tool. Stored as `this._turn` so the
+  // next user turn can await it. Never throws (errors surface via onEvent) so the await is safe.
+  async _speakTurn(signal) {
+    // Tap the LLM stream once: yield speech text to TTS, set aside any tool call for after we
+    // finish speaking. First delta flips us to 'speaking'; accumulate the full answer for the
+    // heard-vs-unheard report. `this.llm(...)` is a lazy generator — its fetch fires only when
+    // tts.speak first pulls, by which point any prior turn is aborted; keeps LLM streams serial.
     let answer = '', call = null;
     const tapped = (async function* (self, src) {
       for await (const item of src) {
@@ -121,30 +131,24 @@ export class VoiceAgent {
       }
     })(this, this.llm(this.history, this.sysmsg, signal));
 
-    let spoken;
+    let spoken = '';
     try {
-      spoken = await this.tts.speak(tapped, signal);   // resolves with text actually heard
+      spoken = await this.tts.speak(tapped, signal);   // resolves with text actually heard (prefix on barge-in)
     } catch (e) {
       if (e.name !== 'AbortError') {                   // real failure (not barge-in) → surface it
         this.onEvent({ type: 'error', error: e.message });
         if (this.state !== 'idle') this._set('listening');
         return;
       }
-      // barge-in: TTS/LLM aborted. Still run the tool if the model already chose one —
-      // a decided tool call must never be dropped just because we stopped speaking.
-      await this._runTool(call);
-      return;
+      // barge-in surfaced as AbortError → fall through and record whatever was heard
     }
-
-    if (signal.aborted) return;                                        // a newer turn superseded us — don't touch state
 
     if (spoken) {
       this.history.push({ role: 'assistant', content: spoken });       // ← heard prefix, not full answer
       this.onEvent({ type: 'assistant', text: spoken, full: answer, final: true });
     }
-
     await this._runTool(call);                                         // model asked for a tool
-    if (this.state !== 'idle') this._set('listening');                 // back to listening (also if tool-only, no speech)
+    if (!signal.aborted && this.state !== 'idle') this._set('listening');   // superseded turns don't touch state
   }
 
   // Run a chosen tool call (if any) and report it. Idempotent-guarded so barge-in and
@@ -167,6 +171,9 @@ export class VoiceAgent {
     const d = window.vad;
     this._vad = await d.MicVAD.new({
       model: 'v5',
+      // Listen on the SAME stream we opened in start() (the chosen mic) — not a second
+      // default-mic getUserMedia. Keeps VAD and STT on one input, and one permission prompt.
+      getStream: async () => this._stream,
       onnxWASMBasePath: `${CDN}onnxruntime-web@1.22.0/dist/`,
       baseAssetPath:    `${CDN}@ricky0123/vad-web@0.0.29/dist/`,
       positiveSpeechThreshold: 0.5, negativeSpeechThreshold: 0.25,
@@ -180,7 +187,7 @@ export class VoiceAgent {
 
   // ── STT (Scribe, VAD-gated, manual commit, lazy reconnect) ──────────────
   async _openWs() {
-    const { token } = await (await fetch(this.tokenUrl, { method: 'POST', headers: { 'X-API-Key': this.apiKey } })).json();
+    const { token } = await (await fetch(this.sttTokenUrl, { method: 'POST', headers: { 'X-API-Key': this.apiKey } })).json();
     const p = new URLSearchParams({ model_id: this.sttModel, commit_strategy: 'manual', audio_format: 'pcm_16000', token });
     if (this.sttLang) p.set('language_code', this.sttLang);
     for (const k of this.keyterms) p.append('keyterms', k);   // repeated param, not comma-joined — bias STT towards domain terms
@@ -346,28 +353,28 @@ export class PiperTTS {
   }
 
   // `input` is an async iterable of text deltas (or a plain string).
-  // Pipeline: synthesize ONE sentence ahead, play strictly in order one-at-a-time. Keeping a
-  // single synth in flight means the next clip is ready (or close) when the current ends —
-  // minimal gap — without ever overlapping playback.
+  // Pipeline for low first-audio latency AND no gaps: play the current sentence the moment
+  // its audio is ready, and WHILE it plays pull + synthesize the next one. So sentence 1 starts
+  // as soon as it's synthesized (not after sentence 2's boundary), and each later clip is ready
+  // when the current ends. Playback is awaited one-at-a-time → never two voices at once.
   async speak(input, signal) {
     if (signal?.aborted) return '';
     const src = typeof input === 'string' ? (async function* () { yield input; })() : input;
+    const it = this._sentences(src, signal)[Symbol.asyncIterator]();
 
     const spokenParts = [];
-    let nextBufP = null, nextText = '';                 // the one sentence synthesized ahead
-    for await (const sentence of this._sentences(src, signal)) {
-      // Kick off this sentence's synth, then play whatever was queued from the previous round.
-      const bufP = this._synth(sentence, signal);
-      if (nextBufP) {
-        const heard = await this._playBuf(await nextBufP, nextText, signal);
-        spokenParts.push(heard);
-        if (heard.length < nextText.length || signal?.aborted) { await bufP; return spokenParts.join(' '); }  // barge-in mid-sentence
-      }
-      nextBufP = bufP; nextText = sentence;
-    }
-    // Drain the last queued sentence.
-    if (nextBufP && !signal?.aborted) {
-      spokenParts.push(await this._playBuf(await nextBufP, nextText, signal));
+    let cur = await it.next();
+    if (cur.done) return '';
+    let curBufP = this._synth(cur.value, signal);       // synth sentence 1
+    while (!cur.done) {
+      const text = cur.value;
+      const playP = this._playBuf(await curBufP, text, signal);   // start playback (don't await yet)
+      const nxt = await it.next();                               // meanwhile pull the next sentence…
+      const nextBufP = nxt.done ? null : this._synth(nxt.value, signal);   // …and synth it one ahead
+      const heard = await playP;                                 // now wait for this clip to finish
+      spokenParts.push(heard);
+      if (heard.length < text.length || signal?.aborted) return spokenParts.join(' ');   // barge-in mid-sentence
+      cur = nxt; curBufP = nextBufP;
     }
     return spokenParts.join(' ').trim();                // joined with spaces at splits (model may omit them)
   }
