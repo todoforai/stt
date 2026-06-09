@@ -115,13 +115,15 @@ export class VoiceAgent {
   _commit() { if (this._ws?.readyState === 1) this._sendCommit(); else this._outbox.push('commit'); }
 }
 
-// ── default LLM: streamed Haiku via /llm proxy (key stays server-side) ────
+// ── default LLM: Haiku via /llm proxy (key stays server-side) ────────────
 async function defaultLLM(history, system, signal) {
   const r = await fetch('/llm', {
     method: 'POST', signal, headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ system, messages: history }),
   });
-  return (await r.json()).text;
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || r.statusText);   // surface "LLM service down" instead of speaking undefined
+  return data.text;
 }
 
 // ── default TTS: browser speechSynthesis. Interruptible; gives exact spoken

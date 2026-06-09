@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <title>Voice Agent — VAD → STT → LLM → TTS</title>
+  <style>
+    body { font: 15px system-ui, sans-serif; max-width: 720px; margin: 1.5rem auto; padding: 0 1rem; }
+    button, select, textarea { font: inherit; }
+    button { padding: .55em 1em; border-radius: 8px; border: 1px solid #ccc; background: #fff; cursor: pointer; }
+    button:disabled { opacity: .4; cursor: default; }
+    .row { display: flex; gap: .6em; align-items: center; flex-wrap: wrap; }
+    textarea { width: 100%; box-sizing: border-box; padding: .6em; border-radius: 8px; border: 1px solid #ccc; resize: vertical; }
+    /* state badge */
+    #state { display: inline-flex; align-items: center; gap: .5em; padding: .4em .9em; border-radius: 999px;
+             font-weight: 600; background: #eee; color: #666; }
+    #state .dot { width: .7em; height: .7em; border-radius: 50%; background: currentColor; }
+    #state.listening { background: #dbeafe; color: #1d4ed8; }
+    #state.thinking  { background: #fef3c7; color: #b45309; }
+    #state.speaking  { background: #d7f5dd; color: #15803d; }
+    #state.speaking .dot, #state.listening .dot { animation: pulse 1s infinite; }
+    @keyframes pulse { 50% { opacity: .3; } }
+    /* chat */
+    #chat { margin-top: 1rem; display: flex; flex-direction: column; gap: .5rem; }
+    .msg { max-width: 80%; padding: .55em .8em; border-radius: 14px; white-space: pre-wrap; line-height: 1.4; }
+    .msg.user      { align-self: flex-end;   background: #1d4ed8; color: #fff; border-bottom-right-radius: 4px; }
+    .msg.assistant { align-self: flex-start; background: #f1f3f5; color: #111; border-bottom-left-radius: 4px; }
+    .msg .unheard { opacity: .35; }   /* barge-in: part of the answer the user never heard */
+    .hint { color: #888; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>Voice Agent</h1>
+  <p class="hint">Beszélj — átírjuk, gondolkodunk, és visszabeszélünk. Bármikor <b>közbevághatsz</b>:
+     amint megszólalsz, leáll a beszéd és csak az addig <i>elhangzott</i> rész kerül az előzménybe.
+     Pipeline: helyi VAD → Scribe STT → LLM (<code>Haiku 4.5</code>, CLIProxyAPI) → böngésző TTS.
+     Az A/B VAD-összehasonlító külön él: <a href="scribe-realtime.html">scribe-realtime.html</a>.</p>
+
+  <p>
+    <label>Rendszerüzenet (persona):</label>
+    <textarea id="sysmsg" rows="3">Te egy barátságos, tömör magyar hangsegéd vagy. Röviden, 1-2 mondatban válaszolj, természetes beszélt nyelven. Ne sorolj fel hosszan, ne használj felsorolásjeleket.</textarea>
+  </p>
+
+  <div class="row">
+    <label>Nyelv:
+      <select id="lang">
+        <option value="hu" selected>Magyar (hu)</option>
+        <option value="en">English (en)</option>
+        <option value="">auto</option>
+      </select>
+    </label>
+    <button id="start">● Start</button>
+    <button id="stop" disabled>■ Stop</button>
+    <span id="state"><span class="dot"></span><span id="stateLabel">idle</span></span>
+  </div>
+
+  <div id="chat"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js"></script>
+  <script type="module">
+    import { VoiceAgent } from './voice-agent.js';
+
+    const $ = id => document.getElementById(id);
+    const chat = $('chat');
+    let agent = null, lastAssistant = null;
+
+    const addMsg = (role, text) => {
+      const el = document.createElement('div');
+      el.className = `msg ${role}`;
+      el.textContent = text;
+      chat.appendChild(el);
+      chat.scrollIntoView({ block: 'end' });
+      return el;
+    };
+
+    const onEvent = e => {
+      if (e.type === 'state') {
+        $('state').className = e.state;
+        $('stateLabel').textContent = e.state;
+      } else if (e.type === 'user') {
+        addMsg('user', e.text);
+        lastAssistant = null;
+      } else if (e.type === 'assistant') {
+        // e.text = heard prefix, e.full = full generated answer.
+        const el = addMsg('assistant', e.text);
+        if (e.full && e.full !== e.text) {                       // barge-in: show unheard tail dimmed
+          const tail = document.createElement('span');
+          tail.className = 'unheard';
+          tail.textContent = e.full.slice(e.text.length);
+          el.appendChild(tail);
+        }
+      }
+    };
+
+    $('start').onclick = async () => {
+      agent = new VoiceAgent({ sysmsg: $('sysmsg').value, lang: $('lang').value, onEvent });
+      try {
+        await agent.start();
+        $('start').disabled = true; $('stop').disabled = false; $('sysmsg').disabled = $('lang').disabled = true;
+      } catch (err) { alert('Mikrofon / indítás hiba: ' + err.message); agent = null; }
+    };
+    $('stop').onclick = () => {
+      agent?.stop(); agent = null;
+      $('start').disabled = false; $('stop').disabled = true; $('sysmsg').disabled = $('lang').disabled = false;
+    };
+  </script>
+</body>
+</html>
