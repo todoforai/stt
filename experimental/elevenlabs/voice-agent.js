@@ -17,16 +17,27 @@
 const CDN = 'https://cdn.jsdelivr.net/npm/';
 const PREROLL_CHUNKS = 4;   // ~1s kept before VAD fires, so word starts aren't clipped
 
+// Built-in `create_task` tool: forward a command to a high-level AI. Generic/portable, so it
+// lives here — the host only supplies the `run` via the `onTask` option (no need to restate
+// the description/params per product). Merged with (and overridable by) any custom `tools`.
+const CREATE_TASK_TOOL = {
+  description: 'Issue a command to the high-level AI. Call this whenever the user speaks in the FIRST-PERSON PLURAL ("we"/"let\'s" — e.g. Hungarian "csináljuk meg", "nézzük meg", "kérjük le", "indítsuk el"): that is NOT chatting, it is a command to be carried out. Also call it whenever the user otherwise asks you to act on something (create a task / to-do / next step). Forward the command staying close to the user\'s own wording, preserving every important detail they gave — don\'t over-paraphrase or strip specifics. You can suppose the high-level AI already knows everything from our conversation/sysmsg. A plain question or remark that just seeks information or keeps the discussion going ("what\'s the status?", "can you explain that?", "got it, thanks") stays normal conversation — don\'t call this. After calling, confirm it out loud in one short sentence.',
+  params: { content: { type: 'string', description: 'The task to do, in the user\'s own words with all the details they provided.' } },
+};
+
 export class VoiceAgent {
   // `sttLang` is the STT language_code only (TTS voice is fixed by the chosen `tts`).
   // `tools`: { name: { description, params, run(args) } } — exposed to the LLM and run
   // after the spoken answer. `params` is the JSON-schema `properties` for the arguments.
+  // `onTask(args)`: shorthand to enable the built-in `create_task` tool (forward a command
+  // to the high-level AI) without redefining it per host — its `run` is your callback.
   // `keyterms`: domain words to bias STT towards (names, jargon it would otherwise
   // mishear). Max 50, ≤20 chars each; adds a 20% premium to the transcription cost.
-  constructor({ sysmsg = '', llm, llmApiKey = '', tts = defaultTTS, sttLang = 'hu', tools = {}, keyterms = [], onEvent = () => {} } = {}) {
-    this.sysmsg = sysmsg; this.tts = tts; this.sttLang = sttLang; this.tools = tools; this.onEvent = onEvent;
+  constructor({ sysmsg = '', llm, llmApiKey = '', tts = defaultTTS, sttLang = 'hu', tools = {}, onTask, keyterms = [], onEvent = () => {} } = {}) {
+    this.sysmsg = sysmsg; this.tts = tts; this.sttLang = sttLang; this.onEvent = onEvent;
+    this.tools = { ...(onTask ? { create_task: { ...CREATE_TASK_TOOL, run: onTask } } : {}), ...tools };
     this.keyterms = keyterms.filter(k => k && k.length <= 20).slice(0, 50);
-    const defs = Object.entries(tools).map(([name, t]) =>
+    const defs = Object.entries(this.tools).map(([name, t]) =>
       ({ name, description: t.description || '', input_schema: { type: 'object', properties: t.params || {} } }));
     this.llm = llm || makeLLM(defs, llmApiKey);
     this.history = [];
@@ -44,11 +55,16 @@ export class VoiceAgent {
     this._node.onaudioprocess = e => this._feed(e.inputBuffer.getChannelData(0));
     src.connect(this._node); this._node.connect(this._ctx.destination);
     await this._startVad();
+    // Don't talk to a backgrounded tab: stop TTS when hidden (the next turn speaks again
+    // when it's foreground). STT keeps running, so the user isn't cut off mid-sentence.
+    this._onHidden = () => { if (document.hidden) this.tts.stop?.(); };
+    document.addEventListener('visibilitychange', this._onHidden);
     this._set('listening');
   }
 
   stop() {
     this._closed = true; this._abort?.abort(); this.tts.stop?.();
+    document.removeEventListener('visibilitychange', this._onHidden);
     this._vad?.pause(); this._ws?.close();
     this._node?.disconnect(); this._ctx?.close(); this._stream?.getTracks().forEach(t => t.stop());
     this._set('idle');
