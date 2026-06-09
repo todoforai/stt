@@ -21,11 +21,14 @@ export class VoiceAgent {
   // `sttLang` is the STT language_code only (TTS voice is fixed by the chosen `tts`).
   // `tools`: { name: { description, params, run(args) } } — exposed to the LLM and run
   // after the spoken answer. `params` is the JSON-schema `properties` for the arguments.
-  constructor({ sysmsg = '', llm, tts = defaultTTS, sttLang = 'hu', tools = {}, onEvent = () => {} } = {}) {
+  // `keyterms`: domain words to bias STT towards (names, jargon it would otherwise
+  // mishear). Max 50, ≤20 chars each; adds a 20% premium to the transcription cost.
+  constructor({ sysmsg = '', llm, llmApiKey = '', tts = defaultTTS, sttLang = 'hu', tools = {}, keyterms = [], onEvent = () => {} } = {}) {
     this.sysmsg = sysmsg; this.tts = tts; this.sttLang = sttLang; this.tools = tools; this.onEvent = onEvent;
+    this.keyterms = keyterms.filter(k => k && k.length <= 20).slice(0, 50);
     const defs = Object.entries(tools).map(([name, t]) =>
       ({ name, description: t.description || '', input_schema: { type: 'object', properties: t.params || {} } }));
-    this.llm = llm || makeLLM(defs);
+    this.llm = llm || makeLLM(defs, llmApiKey);
     this.history = [];
     this.state = 'idle';           // idle | listening | thinking | speaking
     this._abort = null;            // aborts the in-flight LLM
@@ -58,6 +61,11 @@ export class VoiceAgent {
   // speaking = TTS. No separate 'stage'/'user' events — derive the pipeline from state.
   async _onUserTurn(text) {
     if (!text.trim()) return;
+    // Serialize turns: abort any in-flight LLM + stop any playing TTS before starting a new
+    // one. Without this, a second `committed` transcript spawns a parallel turn → overlapping
+    // (double/triple) TTS and chat bubbles.
+    this._abort?.abort();
+    this.tts.stop?.();
     this.history.push({ role: 'user', content: text });
 
     this._set('thinking');                          // LLM stage
@@ -67,6 +75,9 @@ export class VoiceAgent {
     // Tap the LLM stream once: yield speech text to TTS, set aside any tool call for
     // after we finish speaking. The first delta flips us to 'speaking', and we accumulate
     // the full answer to report heard-vs-unheard on barge-in.
+    // NOTE: `this.llm(...)` returns a lazy async generator — its fetch fires only when the
+    // consumer (tts.speak) first pulls from `tapped`, by which point any prior turn's signal
+    // is already aborted above. This is what prevents parallel LLM streams; keep llm lazy.
     let answer = '', call = null;
     const tapped = (async function* (self, src) {
       for await (const item of src) {
@@ -81,18 +92,36 @@ export class VoiceAgent {
     let spoken;
     try {
       spoken = await this.tts.speak(tapped, signal);   // resolves with text actually heard
-    } catch (e) { if (e.name === 'AbortError') return; throw e; }
+    } catch (e) {
+      if (e.name !== 'AbortError') {                   // real failure (not barge-in) → surface it
+        this.onEvent({ type: 'error', error: e.message });
+        if (this.state !== 'idle') this._set('listening');
+        return;
+      }
+      // barge-in: TTS/LLM aborted. Still run the tool if the model already chose one —
+      // a decided tool call must never be dropped just because we stopped speaking.
+      await this._runTool(call);
+      return;
+    }
+
+    if (signal.aborted) return;                                        // a newer turn superseded us — don't touch state
 
     if (spoken) {
       this.history.push({ role: 'assistant', content: spoken });       // ← heard prefix, not full answer
       this.onEvent({ type: 'assistant', text: spoken, full: answer, final: true });
     }
 
-    if (call) {                                                        // model asked for a tool
-      const result = await this.tools[call.tool]?.run?.(call.args);
-      this.onEvent({ type: 'tool', name: call.tool, args: call.args, result });
-    }
+    await this._runTool(call);                                         // model asked for a tool
     if (this.state !== 'idle') this._set('listening');                 // back to listening (also if tool-only, no speech)
+  }
+
+  // Run a chosen tool call (if any) and report it. Idempotent-guarded so barge-in and
+  // normal completion can't double-run it.
+  async _runTool(call) {
+    if (!call || call.ran) return;
+    call.ran = true;
+    const result = await this.tools[call.tool]?.run?.(call.args);
+    this.onEvent({ type: 'tool', name: call.tool, args: call.args, result });
   }
 
   _onBargeIn() {                       // user spoke while we were talking
@@ -121,12 +150,16 @@ export class VoiceAgent {
     const { token } = await (await fetch('/token', { method: 'POST' })).json();
     const p = new URLSearchParams({ model_id: 'scribe_v2_realtime', commit_strategy: 'manual', audio_format: 'pcm_16000', token });
     if (this.sttLang) p.set('language_code', this.sttLang);
+    for (const k of this.keyterms) p.append('keyterms', k);   // repeated param, not comma-joined — bias STT towards domain terms
     this._sttStart = performance.now();                            // for elapsed timing of this STT turn
     this._ws = new WebSocket(`wss://api.elevenlabs.io/v1/speech-to-text/realtime?${p}`);
     this._ws.onopen = () => { const q = this._outbox; this._outbox = []; for (const it of q) it === 'commit' ? this._sendCommit() : this._sendAudio(it); };
+    this._ws.onerror = ev => { this.onEvent({ type: 'error', error: 'STT socket error' }); console.error('STT ws error', ev); };
+    this._ws.onclose  = ev => { if (ev.code !== 1000) { this.onEvent({ type: 'error', error: `STT closed ${ev.code}: ${ev.reason || 'no reason'}` }); console.error('STT ws closed', ev.code, ev.reason, 'clean:', ev.wasClean); } };
     this._ws.onmessage = ev => {
       const m = JSON.parse(ev.data);
       const ms = Math.round(performance.now() - this._sttStart);
+      if (m.message_type?.endsWith('_error')) { this.onEvent({ type: 'error', error: `${m.message_type}: ${m.error || m.reason || m.message || ''}` }); console.error('STT error msg', m); return; }
       if (m.message_type === 'partial_transcript') {
         this.onEvent({ type: 'stt', final: false, text: m.text || '', ms });     // live interim transcript
       } else if (m.message_type?.startsWith('committed') && m.text) {
@@ -155,21 +188,25 @@ export class VoiceAgent {
   _commit() { if (this._ws?.readyState === 1) this._sendCommit(); else this._outbox.push('commit'); }
 }
 
-// ── default LLM: Haiku via /llm proxy (key stays server-side), SSE-streamed ──
-//    Yields { text } for speech deltas and { tool, args } when the model calls a tool
-//    (args is the JSON string, streamed). Throws on a non-OK response so the agent
-//    surfaces "LLM service down" instead of speaking undefined.
-function makeLLM(tools = []) {
+// ── default LLM: Haiku straight from CLIProxyAPI (no Python /llm proxy), SSE-streamed ──
+//    Posts the native Anthropic Messages request and parses the native SSE: text_delta →
+//    { text }, tool_use content_block → { tool, args } (input_json_delta accumulated).
+//    The `claude-cli` User-Agent skips the proxy's cloaking so our system prompt + native
+//    tools reach the model unchanged (that's what gives real tool_use, not XML text).
+//    Throws on a non-OK response so the agent surfaces the error instead of speaking junk.
+const LLM_URL = 'http://localhost:4000/api/v1/llm';      // backend SSE route (CLIProxyAPI key stays server-side)
+function makeLLM(tools = [], apiKey = '') {
   return async function* (history, system, signal) {
-    const r = await fetch('/llm', {
-      method: 'POST', signal, headers: { 'Content-Type': 'application/json' },
+    const r = await fetch(LLM_URL, {
+      method: 'POST', signal,
+      headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
       body: JSON.stringify({ system, messages: history, tools }),
     });
     if (!r.ok) throw new Error((await r.json().catch(() => ({})))?.error || r.statusText);
 
     const reader = r.body.getReader();
     const dec = new TextDecoder();
-    let buf = '', tool = null, args = '';
+    let buf = '', tool = null, args = null;
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
@@ -179,13 +216,13 @@ function makeLLM(tools = []) {
         const line = buf.slice(0, nl).trim();
         buf = buf.slice(nl + 1);
         if (!line.startsWith('data:')) continue;
-        const m = JSON.parse(line.slice(5).trim());
+        const m = JSON.parse(line.slice(5).trim());      // backend chunks: { text } | { tool, args } | { error }
+        if (m.error) throw new Error(m.error);
         if (m.text != null) yield { text: m.text };
-        else if (m.tool != null) tool = m.tool;          // tool_use started; args stream next
-        else if (m.args != null) args += m.args;         // accumulate the JSON arguments
+        else if (m.tool != null) { tool = m.tool; args = m.args; }   // tool call (args already parsed)
       }
     }
-    if (tool) yield { tool, args: args ? JSON.parse(args) : {} };
+    if (tool) yield { tool, args: args ?? {} };
   };
 }
 
@@ -198,13 +235,24 @@ function firstSentenceEnd(s) {
   return m ? m.index + m[0].trimEnd().length : -1;
 }
 
+// First sentence ender (. ! ? …, or a trailing-space colon) in `s`, or -1 — used for every
+// sentence after the first, where we prefer whole sentences (fewer cuts, better prosody) over
+// the earliest break. A colon ends a clause often enough to be a good, natural TTS break.
+function sentenceEnd(s) {
+  const m = /[.!?…]+(?=\s|$)|:(?=\s)/.exec(s);
+  return m ? m.index + m[0].trimEnd().length : -1;
+}
+
 // ── default TTS: Piper (local WASM, free, has Hungarian) via @mintplex-labs/piper-tts-web.
-//    Takes an async iterator of text deltas. Two-phase for low first-audio latency:
-//      1. as soon as sentence 1's boundary arrives → synth + PLAY it (short → fast).
-//      2. drain the rest of the stream, synth it in ONE call (good prosody), play after.
-//    Both synth calls run while audio plays, so there's no gap. Whole WAVs (no char
-//    timings) → on barge-in the heard prefix is estimated proportionally per chunk;
-//    sentence 1 is known-complete once chunk 2 starts. Voice: hu_HU-anna-medium.
+//    Takes an async iterator of text deltas. Streams sentence-by-sentence for low latency
+//    AND small inter-sentence gaps on long answers:
+//      • re-chunk the deltas into sentences (sentence 1 on the earliest natural break for
+//        fast first audio; later ones on whole-sentence enders for better prosody).
+//      • synth ONE sentence ahead while the current one plays, so the next WAV is ready (or
+//        nearly) the moment the current finishes — no growing gap as the answer gets longer.
+//      • play STRICTLY in order, one clip at a time (never two voices at once).
+//    Whole WAVs (no char timings) → on barge-in the heard prefix is estimated proportionally
+//    within the playing sentence. Voice: hu_HU-anna-medium.
 const CDN_PIPER = `${CDN}@mintplex-labs/piper-tts-web@1.0.4/dist/piper-tts-web.js`;
 class PiperTTS {
   constructor(voiceId = 'hu_HU-anna-medium') { this.voiceId = voiceId; this._ctx = null; this._node = null; }
@@ -236,40 +284,52 @@ class PiperTTS {
     });
   }
 
+  // Re-chunk an async iterable of text deltas into sentences. The FIRST sentence breaks on
+  // the earliest natural boundary (fast first audio); the rest on whole-sentence enders
+  // (better prosody). Flushes whatever's left when the stream ends.
+  async *_sentences(src, signal) {
+    const it = src[Symbol.asyncIterator]();
+    const next = async () => { try { return await it.next(); } catch (e) { if (e.name === 'AbortError') return { done: true }; throw e; } };
+    let acc = '', first = true;
+    for (let r = await next(); !r.done; r = await next()) {
+      if (signal?.aborted) return;
+      acc += r.value;
+      let end;
+      while ((end = (first ? firstSentenceEnd : sentenceEnd)(acc)) >= 0) {
+        const s = acc.slice(0, end).trim();
+        acc = acc.slice(end).trimStart();
+        if (s) { yield s; first = false; }
+      }
+    }
+    const tail = acc.trim();
+    if (tail) yield tail;
+  }
+
   // `input` is an async iterable of text deltas (or a plain string).
+  // Pipeline: synthesize ONE sentence ahead, play strictly in order one-at-a-time. Keeping a
+  // single synth in flight means the next clip is ready (or close) when the current ends —
+  // minimal gap — without ever overlapping playback.
   async speak(input, signal) {
     if (signal?.aborted) return '';
     const src = typeof input === 'string' ? (async function* () { yield input; })() : input;
-    // One manual iterator, driven across both phases — a `for await … break` would
-    // call return() and CLOSE the generator, losing everything after sentence 1.
-    const it = src[Symbol.asyncIterator]();
-    const next = async () => { try { return await it.next(); } catch (e) { if (e.name === 'AbortError') return { done: true }; throw e; } };
 
-    // Phase 1: accumulate until sentence 1's boundary, then split there.
-    let acc = '', first = '', rest = '';
-    for (let r = await next(); !r.done; r = await next()) {
-      acc += r.value;
-      const end = firstSentenceEnd(acc);
-      if (end >= 0) { first = acc.slice(0, end); rest = acc.slice(end); break; }
+    const spokenParts = [];
+    let nextBufP = null, nextText = '';                 // the one sentence synthesized ahead
+    for await (const sentence of this._sentences(src, signal)) {
+      // Kick off this sentence's synth, then play whatever was queued from the previous round.
+      const bufP = this._synth(sentence, signal);
+      if (nextBufP) {
+        const heard = await this._playBuf(await nextBufP, nextText, signal);
+        spokenParts.push(heard);
+        if (heard.length < nextText.length || signal?.aborted) { await bufP; return spokenParts.join(' '); }  // barge-in mid-sentence
+      }
+      nextBufP = bufP; nextText = sentence;
     }
-    if (!first) { first = acc; rest = ''; }   // stream ended with no sentence break
-    if (signal?.aborted && !first) return '';
-
-    // Synthesize + start sentence 1 playing; meanwhile drain the rest of the stream.
-    const firstHeardP = this._synth(first, signal).then(b => this._playBuf(b, first, signal));
-    for (let r = await next(); !r.done; r = await next()) rest += r.value;
-    rest = rest.trimStart();
-
-    // Synthesize the rest NOW (in parallel, while sentence 1 is still playing).
-    const restBufP = this._synth(rest, signal);
-
-    // If user barged in during sentence 1, stop here with its heard prefix.
-    const heardFirst = await firstHeardP;
-    if (heardFirst.length < first.length || signal?.aborted) return heardFirst;
-
-    // Sentence 1 done; the rest buffer is ready (or nearly) → play with no gap.
-    const heardRest = await this._playBuf(await restBufP, rest, signal);
-    return heardRest ? `${first} ${heardRest}` : first;   // space at the split (model may omit it)
+    // Drain the last queued sentence.
+    if (nextBufP && !signal?.aborted) {
+      spokenParts.push(await this._playBuf(await nextBufP, nextText, signal));
+    }
+    return spokenParts.join(' ').trim();                // joined with spaces at splits (model may omit them)
   }
   stop() { try { this._node?.stop(); } catch {} }
 }

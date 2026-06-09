@@ -87,7 +87,12 @@ Conversation so far:
     <button id="start">● Start</button>
     <button id="stop" disabled>■ Stop</button>
     <span id="state"><span class="dot"></span><span id="stateLabel">idle</span></span>
+    <label title="A választott nyelv szótárából (nspell) hiányzó szavakat keyterm-ként ráhangolja a Scribe STT-re.">
+      <input type="checkbox" id="autoKeyterms" checked /> Auto keyterms
+    </label>
+    <button id="previewKeyterms" type="button">Keyterms előnézet</button>
   </div>
+  <div id="keytermsOut" class="hint"></div>
 
   <!-- pipeline: each stage lights up green while active -->
   <div id="pipe">
@@ -116,6 +121,10 @@ Conversation so far:
     const $ = id => document.getElementById(id);
     const chat = $('chat');
     let agent = null;
+
+    // TODOforAI API key (X-API-Key) for the backend /api/v1/llm route. Use a localStorage
+    // override so the key isn't committed: localStorage.setItem('tfa_api_key', 'tfa_…').
+    const LLM_API_KEY = localStorage.getItem('tfa_api_key') || '';
 
     // ── The conversation the voice agent communicates about (a support case). ──
     // `tool` rows are a tool call + its result. Rendered read-only in #seedView,
@@ -200,23 +209,89 @@ Conversation so far:
           }
         }
       } else if (e.type === 'tool') {
-        renderTool(chat, e.name, e.args?.content ?? JSON.stringify(e.args));   // 🔧 create_task → …
+        renderTool(chat, e.name, e.args?.content ?? JSON.stringify(e.args));   // 🔧 create_task → content
+        chat.scrollIntoView({ block: 'end' });
+      } else if (e.type === 'error') {
+        addMsg('assistant', '⚠️ ' + e.error).classList.add('unheard');   // surface LLM/TTS failures
         chat.scrollIntoView({ block: 'end' });
       }
     };
 
-    // The one tool the voice agent can call: formulate the next task from the conversation.
+    // Brand / product terms the STT mishears in Hungarian speech. These are ALWAYS sent first
+    // (fixed). Keep this minimal: only brand/product words that may NOT appear in the
+    // conversation — everything else (account, plan, restart…) is picked up as an auto keyterm
+    // from the context anyway. Max 50 terms, ≤20 chars each.
+    const KEYTERMS_FIXED = [
+      'TODOforAI', 'create', 'task', 'todo',
+    ];
+
+    // ── Auto keyterms (word-frequency list, lazy) ────────────────────────────
+    // When "Auto keyterms" is on, conversation words that AREN'T among the chosen language's
+    // most-common words are out-of-language / domain terms the STT mishears (names, product,
+    // jargon, commands) — exactly what keyterms biases. A frequency list (not a full spell
+    // dictionary) is the right tool: we only need "is this a common {lang} word?", and a Set
+    // of the top-N words is ~0-cost to load and look up — unlike nspell, which expands every
+    // inflected form in memory and OOMs on agglutinative Hungarian.
+    const FREQ_LANG = { hu: 'hu', en: 'en' };                  // hermitdave/FrequencyWords codes
+    const FREQ_TOP_N = 40000;                                  // common-word cutoff (rarer → keyterm)
+    const KEYTERM_MIN_LEN = 3;                                 // drop 1-2 char fragments (ol, js…)
+    const _commonCache = {};
+    async function getCommonWords(lang) {
+      const code = FREQ_LANG[lang];
+      if (!code) return null;                                  // no list for this lang → skip filtering
+      return _commonCache[code] ??= (async () => {
+        const url = `https://cdn.jsdelivr.net/gh/hermitdave/FrequencyWords@master/content/2016/${code}/${code}_50k.txt`;
+        const txt = await (await fetch(url)).text();           // lines: "word count", desc by frequency
+        return new Set(txt.split('\n').slice(0, FREQ_TOP_N).map(l => l.split(' ')[0]).filter(Boolean));
+      })();
+    }
+
+    // Build the keyterm list for {lang}: fixed terms first, then conversation words not in the
+    // top-N common {lang} words (deduped). Separators/punctuation are split to spaces first
+    // (last_sync → last sync, bridge-et → bridge et, felület. → felület); tokens must start with
+    // a letter (dropping pure numbers) and be ≥KEYTERM_MIN_LEN (dropping ol/js fragments). Auto
+    // terms are sorted short→long so the short, high-value domain words come first and the long,
+    // rare inflected forms sort last — i.e. they're what gets trimmed first at the 50-term cap.
+    async function buildKeyterms(lang) {
+      const fixed = [...KEYTERMS_FIXED];
+      if (!$('autoKeyterms').checked) return fixed;
+      const common = await getCommonWords(lang);
+      if (!common) return fixed;
+      const text = SEED.map(m => `${m.text} ${m.name || ''}`).join(' ').replace(/[._\-/@()"'{}:;,!?…→]+/g, ' ');
+      const lower = new Set(fixed.map(t => t.toLowerCase()));
+      const auto = [];
+      for (const w of text.match(/[\p{L}][\p{L}\p{N}]*/gu) || []) {
+        const key = w.toLowerCase();
+        if (key.length < KEYTERM_MIN_LEN || lower.has(key) || common.has(key)) continue;
+        lower.add(key); auto.push(key);                        // lowercase: STT bias is case-insensitive
+      }
+      auto.sort((a, b) => a.length - b.length);                // longest last → trimmed first at the cap
+      return [...fixed, ...auto];
+    }
+
+    // The one tool the voice agent can call: create a task from the conversation.
     const TOOLS = {
       create_task: {
         description: 'Call when the user asks you to act on something (create a task / to-do / next step). Formulate the next task from the conversation. After calling, confirm it out loud in one short sentence.',
         params: { content: { type: 'string', description: 'The task to do, phrased clearly.' } },
-        run: ({ content }) => { console.log('TASK created:', content); return { ok: true }; },
+        run: ({ content }) => { console.log('create_task', content); return { ok: true }; },
       },
+    };
+
+    // Preview what auto-keyterms extracts for the current language (no mic, no LLM).
+    $('previewKeyterms').onclick = async () => {
+      const lang = $('lang').value;
+      $('keytermsOut').textContent = 'keyterms betöltése…';
+      try {
+        const terms = await buildKeyterms(lang);
+        $('keytermsOut').textContent = `${terms.length} keyterm (${lang}): ${terms.join(', ')}`;
+      } catch (e) { $('keytermsOut').textContent = '⚠️ keyterms hiba: ' + e.message; }
     };
 
     $('start').onclick = async () => {
       const lang = $('lang').value;
-      agent = new VoiceAgent({ sysmsg: buildSysmsg(lang), sttLang: lang, tools: TOOLS, onEvent });
+      const keyterms = await buildKeyterms(lang);
+      agent = new VoiceAgent({ sysmsg: buildSysmsg(lang), sttLang: lang, tools: TOOLS, keyterms, llmApiKey: LLM_API_KEY, onEvent });
       try {
         await agent.start();
         $('start').disabled = true; $('stop').disabled = false;
