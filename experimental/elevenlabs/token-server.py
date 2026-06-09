@@ -7,7 +7,8 @@ token (sutkn_...) and a plain {text} reply from the /llm proxy.
 
   - POST /token  → ElevenLabs single-use Scribe token (uses ELEVENLABS_API_KEY)
   - POST /llm    → CLIProxyAPI chat (free via subscription). Body {system, messages}
-                   → {text}. Haiku 4.5, free via the Claude Code subscription.
+                   → SSE stream of {"text": "..."} deltas (so TTS can start on the
+                   first sentence). Haiku 4.5, free via the Claude Code subscription.
 
                    The `User-Agent: claude-cli/...` header is REQUIRED: without it the
                    proxy "cloaks" claude-* requests (mode:auto → cloak any non-claude-cli
@@ -67,12 +68,18 @@ class Handler(SimpleHTTPRequestHandler):
         if not CLIPROXY_KEY:
             return self._json({"error": "CLIPROXYAPI_API_KEY not set — LLM service down"}, 503)
         body = self._read_body()
-        payload = json.dumps({
+        tools = body.get("tools", [])
+        req_body = {
             "model": LLM_MODEL,
             "max_tokens": 1024,
+            "stream": True,
             "system": body.get("system", ""),
             "messages": body.get("messages", []),
-        }).encode()
+        }
+        if tools:                                     # let the model decide whether to call a tool
+            req_body["tools"] = tools
+            req_body["tool_choice"] = {"type": "auto"}
+        payload = json.dumps(req_body).encode()
         req = urllib.request.Request(
             f"{CLIPROXY_URL}/v1/messages",
             data=payload,
@@ -80,13 +87,41 @@ class Handler(SimpleHTTPRequestHandler):
             headers={"x-api-key": CLIPROXY_KEY, "anthropic-version": "2023-06-01",
                      "content-type": "application/json", "User-Agent": LLM_USER_AGENT},
         )
+        # Re-emit the upstream Anthropic SSE as a minimal {text} delta stream.
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                data = json.load(r)
+            upstream = urllib.request.urlopen(req, timeout=30)
         except Exception as e:
             return self._json({"error": f"LLM proxy failed: {e}"}, 502)
-        text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
-        self._json({"text": text})
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        # `urllib` yields lines split on b"\n"; an SSE `data:` line is complete by then,
+        # so decode the whole line at once (NOT byte-chunks) to keep multi-byte UTF-8 intact.
+        # Re-emit a minimal stream: {"text": …} for speech, {"tool": name}/{"args": json}
+        # for a tool_use block (Anthropic streams its arguments as input_json_delta).
+        def send(obj):
+            self.wfile.write(f"data: {json.dumps(obj)}\n\n".encode())   # ensure_ascii → JSON.parse restores emoji
+            self.wfile.flush()
+        try:
+            for raw in upstream:
+                line = raw.decode("utf-8").strip()
+                if not line.startswith("data:"):
+                    continue
+                ev = json.loads(line[5:].strip())
+                t = ev.get("type")
+                if t == "content_block_start" and ev["content_block"].get("type") == "tool_use":
+                    send({"tool": ev["content_block"]["name"]})
+                elif t == "content_block_delta":
+                    d = ev["delta"]
+                    if d.get("type") == "text_delta":
+                        send({"text": d["text"]})
+                    elif d.get("type") == "input_json_delta":
+                        send({"args": d["partial_json"]})
+        except Exception:
+            pass  # client gone / upstream closed — nothing left to send
+        finally:
+            upstream.close()
 
 
 if __name__ == "__main__":

@@ -19,9 +19,12 @@ talking and know **exactly how much of our answer was already heard**.
 2. **STT** (ElevenLabs Scribe v2 realtime) — speech → text. `commit_strategy=manual`;
    the local VAD's `onSpeechEnd` sends `commit:true` to close a turn.
 3. **LLM** (Anthropic Haiku) — `(systemPrompt, committedTranscript)` → reply,
-   **streamed** so TTS can start on the first sentence.
-4. **TTS** (Piper — local, free, has HU; ElevenLabs optional) — text → audio,
-   played sentence-by-sentence.
+   **streamed** (SSE) so TTS can start on the first sentence.
+4. **TTS** (Piper — local, free, has HU; ElevenLabs optional) — text → audio.
+   **Two-phase:** sentence 1 is synthesized + played the moment its boundary
+   arrives in the stream (low first-audio latency); the rest is collected and
+   synthesized in **one** call (better prosody than per-sentence) in parallel,
+   so it's ready by the time sentence 1 finishes — no gap.
 
 ## Interruption (the hard requirement)
 
@@ -120,5 +123,6 @@ system prompt reaches Anthropic unchanged.
 - [x] LLM stage (CLIProxyAPI Haiku 4.5, via `/llm` proxy, `claude-cli` UA to skip cloaking)
 - [x] Barge-in: stop TTS + abort LLM on VAD speech-start, record heard prefix
 - [x] Voice-agent demo wiring the 4 stages (`index.html` + `voice-agent.js`)
-- [ ] TTS stage: browser `speechSynthesis` today → Piper (local, HU) for per-sentence + exact `spokenSoFar`
-- [ ] Stream the LLM per-sentence into TTS (first-sentence latency; `streamLLM` exists backend-side)
+- [x] TTS stage: Piper (local, HU) via WASM; whole-WAV playback, proportional `spokenSoFar`
+- [x] Stream the LLM (SSE) and start TTS on the first sentence (two-phase: sentence 1 now, rest in one parallel synth — no gap)
+- [ ] Exact `spokenSoFar` (char-level alignment) — needs ElevenLabs TTS; Piper gives only proportional estimate

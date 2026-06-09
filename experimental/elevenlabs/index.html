@@ -19,33 +19,69 @@
     #state.speaking  { background: #d7f5dd; color: #15803d; }
     #state.speaking .dot, #state.listening .dot { animation: pulse 1s infinite; }
     @keyframes pulse { 50% { opacity: .3; } }
-    /* chat */
-    #chat { margin-top: 1rem; display: flex; flex-direction: column; gap: .5rem; }
+    /* chat + seed share the bubble layout */
+    #chat, #seedView { margin-top: 1rem; display: flex; flex-direction: column; gap: .5rem; }
+    #seedView { margin: .5rem 0; padding: .6rem; border: 1px solid #eee; border-radius: 10px; background: #fcfcfc; }
     .msg { max-width: 80%; padding: .55em .8em; border-radius: 14px; white-space: pre-wrap; line-height: 1.4; }
     .msg.user      { align-self: flex-end;   background: #1d4ed8; color: #fff; border-bottom-right-radius: 4px; }
     .msg.assistant { align-self: flex-start; background: #f1f3f5; color: #111; border-bottom-left-radius: 4px; }
+    .msg.tool      { align-self: center; background: #1e1e2e; color: #a6e3a1; font: 12px ui-monospace, monospace;
+                     max-width: 92%; border-radius: 8px; }
+    .msg.tool .tool-name { color: #f9e2af; font-weight: 700; }
     .msg .unheard { opacity: .35; }   /* barge-in: part of the answer the user never heard */
+    .seed-divider { align-self: center; color: #aaa; font-size: 12px; margin: .3rem 0; }
     .hint { color: #888; font-size: 13px; }
+    /* pipeline: VAD → STT → LLM → TTS, each lights up while active */
+    #pipe { display: flex; align-items: stretch; gap: 0; margin: 1rem 0; user-select: none; }
+    #pipe .stage { flex: 1; text-align: center; padding: .6em .3em; border: 1px solid #ddd; background: #fafafa;
+                   color: #999; font-size: 13px; font-weight: 600; transition: all .15s; }
+    #pipe .stage:first-child { border-radius: 8px 0 0 8px; }
+    #pipe .stage:last-child  { border-radius: 0 8px 8px 0; }
+    #pipe .stage + .stage { border-left: none; }
+    #pipe .stage .sub { display: block; font-weight: 400; font-size: 11px; color: #aaa; margin-top: .15em; }
+    #pipe .stage.on { background: #15803d; border-color: #15803d; color: #fff; box-shadow: 0 0 0 2px #15803d33; }
+    #pipe .stage.on .sub { color: #d7f5dd; }
+    #pipe .arrow { align-self: center; color: #ccc; padding: 0 .35em; }
+    details summary { cursor: pointer; color: #555; font-size: 13px; }
+    #stt { min-height: 1.4em; font-style: italic; margin: -.4rem 0 .6rem; }
+    #stt b { font-style: normal; color: #15803d; }   /* committed text */
+    #stt .t { font-style: normal; color: #bbb; }      /* timing */
   </style>
 </head>
 <body>
   <h1>Voice Agent</h1>
-  <p class="hint">Beszélj — átírjuk, gondolkodunk, és visszabeszélünk. Bármikor <b>közbevághatsz</b>:
-     amint megszólalsz, leáll a beszéd és csak az addig <i>elhangzott</i> rész kerül az előzménybe.
-     Pipeline: helyi VAD → Scribe STT → LLM (<code>Haiku 4.5</code>, CLIProxyAPI) → böngésző TTS.
+  <p class="hint">A voice agent egy <b>kommunikátor</b>: a betöltött beszélgetés alapján először röviden
+     összefoglalja a státuszt, majd részletez, és közben reagál a kérdéseidre — a választott nyelven.
+     Nyomd meg a <b>Start</b>-ot és beszélj; bármikor <b>közbevághatsz</b>.
+     Pipeline: helyi VAD → Scribe STT → LLM (<code>Haiku 4.5</code>, streamelt) → Piper TTS.
      Az A/B VAD-összehasonlító külön él: <a href="scribe-realtime.html">scribe-realtime.html</a>.</p>
 
-  <p>
-    <label>Rendszerüzenet (persona):</label>
-    <textarea id="sysmsg" rows="3">Te egy barátságos, tömör magyar hangsegéd vagy. Röviden, 1-2 mondatban válaszolj, természetes beszélt nyelven. Ne sorolj fel hosszan, ne használj felsorolásjeleket.</textarea>
-  </p>
+  <details>
+    <summary><b>System prompt</b> (kommunikátor-szerep, angol) — <code>{lang}</code> és <code>{conversation}</code> behelyettesítve a Startkor</summary>
+    <textarea id="sysmsg" rows="10" style="margin-top:.5em">You are a voice agent on a live call. Your words are read aloud by TTS, and the user's words reach you via STT (so expect typos and mis-hearings — interpret charitably). Write for the ear: short sentences, plain words, no lists, no markdown, no emojis.
+
+Brief the user about the support case below:
+1. Open with ONE short sentence on the current status.
+2. Then add detail, a sentence or two at a time.
+3. The user may interrupt anytime — answer directly, then go on.
+
+Speak only in {lang}.
+
+Conversation so far:
+{conversation}</textarea>
+    <p class="hint" style="margin:.3em 0 0">A nyelv (<code>{lang}</code>) a voice agent paramétere — a választó vezérli az STT-t és a beszéd nyelvét is.</p>
+  </details>
+
+  <details open>
+    <summary><b>A beszélgetés</b>, amiről a voice agent beszél (szerkeszthető a fenti SEED-ben)</summary>
+    <div id="seedView"></div>
+  </details>
 
   <div class="row">
-    <label>Nyelv:
+    <label>Nyelv ({lang}):
       <select id="lang">
         <option value="hu" selected>Magyar (hu)</option>
         <option value="en">English (en)</option>
-        <option value="">auto</option>
       </select>
     </label>
     <button id="start">● Start</button>
@@ -53,55 +89,144 @@
     <span id="state"><span class="dot"></span><span id="stateLabel">idle</span></span>
   </div>
 
+  <!-- pipeline: each stage lights up green while active -->
+  <div id="pipe">
+    <div class="stage" data-stage="vad">VAD<span class="sub">beszéd?</span></div>
+    <div class="arrow">→</div>
+    <div class="stage" data-stage="stt">STT<span class="sub">Scribe átír</span></div>
+    <div class="arrow">→</div>
+    <div class="stage" data-stage="llm">LLM<span class="sub">Haiku gondolkodik</span></div>
+    <div class="arrow">→</div>
+    <div class="stage" data-stage="tts">TTS<span class="sub">Piper beszél</span></div>
+  </div>
+  <!-- live STT: interim transcript + commit latency -->
+  <div id="stt" class="hint"></div>
+
   <div id="chat"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js"></script>
+  <!-- Piper imports "onnxruntime" as a bare specifier; map it (esm.sh's Node shims break Emscripten). -->
+  <script type="importmap">
+  { "imports": { "onnxruntime-web": "https://esm.sh/onnxruntime-web@1.18.0" } }
+  </script>
   <script type="module">
     import { VoiceAgent } from './voice-agent.js';
 
     const $ = id => document.getElementById(id);
     const chat = $('chat');
-    let agent = null, lastAssistant = null;
+    let agent = null;
 
-    const addMsg = (role, text) => {
+    // ── The conversation the voice agent communicates about (a support case). ──
+    // `tool` rows are a tool call + its result. Rendered read-only in #seedView,
+    // and injected into the system prompt as {conversation} at Start.
+    const SEED = [
+      { role: 'user',      text: 'Szia! Nem tölt be a TODO listám, üres a felület.' },
+      { role: 'tool',      name: 'get_account',  text: 'get_account(email="kovacs.anna@…") → { plan: "pro", todos: 142, last_sync: "3 napja" }' },
+      { role: 'assistant', text: 'Szia Anna! Látom, 142 TODO-d van, de a szinkron 3 napja állt le — valószínűleg a bridge kapcsolat szakadt meg.' },
+      { role: 'user',      text: 'Hogyan tudom újraindítani a bridge-et?' },
+      { role: 'tool',      name: 'search_docs',  text: 'search_docs("restart bridge") → "Futtasd: todoforai-bridge --restart, vagy a tálcán jobb klikk → Restart."' },
+      { role: 'assistant', text: 'A tálcaikonon jobb klikk, majd Restart — vagy terminálból a todoforai-bridge --restart paranccsal.' },
+    ];
+    const LANG_NAME = { hu: 'Hungarian', en: 'English' };
+
+    // Render a message into a container (#chat for live turns, #seedView for the seed).
+    const renderInto = (container, role, text) => {
       const el = document.createElement('div');
       el.className = `msg ${role}`;
       el.textContent = text;
-      chat.appendChild(el);
-      chat.scrollIntoView({ block: 'end' });
+      container.appendChild(el);
       return el;
     };
+    const renderTool = (container, name, text) => {
+      const el = renderInto(container, 'tool', '');
+      const n = document.createElement('span');
+      n.className = 'tool-name';
+      n.textContent = `🔧 ${name}  `;
+      el.append(n, document.createTextNode(text));
+      return el;
+    };
+    const addMsg  = (role, text) => { const el = renderInto(chat, role, text); chat.scrollIntoView({ block: 'end' }); return el; };
+
+    // Render the seed conversation read-only (always visible — it's the topic).
+    for (const m of SEED) m.role === 'tool' ? renderTool($('seedView'), m.name, m.text) : renderInto($('seedView'), m.role, m.text);
+
+    // Build the system prompt: fill {lang} + {conversation} into the communicator template.
+    const buildSysmsg = (lang) => {
+      const label = { user: 'CUSTOMER', assistant: 'AGENT', tool: 'TOOL' };
+      const convo = SEED.map(m =>
+        m.role === 'tool' ? `[${label.tool}] ${m.name}: ${m.text}` : `${label[m.role]}: ${m.text}`).join('\n');
+      return $('sysmsg').value
+        .replaceAll('{lang}', LANG_NAME[lang] || lang)
+        .replace('{conversation}', convo);
+    };
+
+    // Each pipeline box is lit independently, so VAD and STT stay separately observable:
+    //   vad event → VAD box · stt interim/final → STT box · state thinking/speaking → LLM/TTS box.
+    const lit = (name, on) => document.querySelector(`#pipe .stage[data-stage="${name}"]`)?.classList.toggle('on', on);
+
+    let liveAssistant = null;   // the assistant bubble being streamed into
 
     const onEvent = e => {
       if (e.type === 'state') {
         $('state').className = e.state;
         $('stateLabel').textContent = e.state;
-      } else if (e.type === 'user') {
-        addMsg('user', e.text);
-        lastAssistant = null;
-      } else if (e.type === 'assistant') {
-        // e.text = heard prefix, e.full = full generated answer.
-        const el = addMsg('assistant', e.text);
-        if (e.full && e.full !== e.text) {                       // barge-in: show unheard tail dimmed
-          const tail = document.createElement('span');
-          tail.className = 'unheard';
-          tail.textContent = e.full.slice(e.text.length);
-          el.appendChild(tail);
+        lit('llm', e.state === 'thinking');
+        lit('tts', e.state === 'speaking');
+      } else if (e.type === 'vad') {
+        lit('vad', e.active);                                   // VAD hears speech?
+      } else if (e.type === 'stt') {
+        lit('stt', !e.final);                                   // Scribe transcribing (interim) vs done
+        // live transcript: interim while speaking; on commit → user bubble + clear line.
+        if (e.final) {
+          addMsg('user', e.text);
+          $('stt').innerHTML = '';
+          liveAssistant = null;
+        } else {
+          $('stt').innerHTML = e.text ? `“${e.text}…” <span class="t">${e.ms} ms</span>` : '';
         }
+      } else if (e.type === 'assistant') {
+        // assistant draft grows one bubble token by token; final adds the unheard tail.
+        const el = liveAssistant ??= addMsg('assistant', '');
+        el.textContent = e.text;
+        chat.scrollIntoView({ block: 'end' });
+        if (e.final) {
+          liveAssistant = null;
+          if (e.full && e.full !== e.text) {                     // barge-in: show unheard tail dimmed
+            const tail = document.createElement('span');
+            tail.className = 'unheard';
+            tail.textContent = e.full.slice(e.text.length);
+            el.appendChild(tail);
+          }
+        }
+      } else if (e.type === 'tool') {
+        renderTool(chat, e.name, e.args?.content ?? JSON.stringify(e.args));   // 🔧 create_task → …
+        chat.scrollIntoView({ block: 'end' });
       }
     };
 
+    // The one tool the voice agent can call: formulate the next task from the conversation.
+    const TOOLS = {
+      create_task: {
+        description: 'Call when the user asks you to act on something (create a task / to-do / next step). Formulate the next task from the conversation. After calling, confirm it out loud in one short sentence.',
+        params: { content: { type: 'string', description: 'The task to do, phrased clearly.' } },
+        run: ({ content }) => { console.log('TASK created:', content); return { ok: true }; },
+      },
+    };
+
     $('start').onclick = async () => {
-      agent = new VoiceAgent({ sysmsg: $('sysmsg').value, lang: $('lang').value, onEvent });
+      const lang = $('lang').value;
+      agent = new VoiceAgent({ sysmsg: buildSysmsg(lang), sttLang: lang, tools: TOOLS, onEvent });
       try {
         await agent.start();
-        $('start').disabled = true; $('stop').disabled = false; $('sysmsg').disabled = $('lang').disabled = true;
+        $('start').disabled = true; $('stop').disabled = false;
+        $('sysmsg').disabled = $('lang').disabled = true;
       } catch (err) { alert('Mikrofon / indítás hiba: ' + err.message); agent = null; }
     };
     $('stop').onclick = () => {
       agent?.stop(); agent = null;
-      $('start').disabled = false; $('stop').disabled = true; $('sysmsg').disabled = $('lang').disabled = false;
+      $('start').disabled = false; $('stop').disabled = true;
+      $('sysmsg').disabled = $('lang').disabled = false;
     };
   </script>
 </body>
