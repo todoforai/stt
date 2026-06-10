@@ -47,9 +47,11 @@ export class VoiceAgent {
   //   `sttUrl`/`sttModel` — STT realtime socket + model id (ElevenLabs Scribe by default).
   //   `maxTokens`, `preroll` (chunks kept before VAD fires), `vadOptions` (Silero overrides).
   constructor({ sysmsg = '', llm, apiKey = '', baseUrl = BASE_URL, llmUrl = `${baseUrl}/llm`, maxTokens = 1024,
-                tts = defaultTTS, sttLang = 'hu', micDeviceId = '', sttTokenUrl = `${baseUrl}/stt/token`, sttUrl = STT_URL, sttModel = STT_MODEL,
+                tts, sttLang = 'hu', micDeviceId = '', sttTokenUrl = `${baseUrl}/stt/token`, sttUrl = STT_URL, sttModel = STT_MODEL,
                 tools = {}, onTask, keyterms = [], preroll = PREROLL_CHUNKS, vadOptions = {}, onEvent = () => {} } = {}) {
-    this.sysmsg = sysmsg; this.tts = tts; this.sttLang = sttLang; this.onEvent = onEvent;
+    // Each agent gets its own PiperTTS (it owns an AudioContext + playing node) — a shared
+    // module-level default would make two agents fight over one audio output.
+    this.sysmsg = sysmsg; this.tts = tts ?? new PiperTTS(); this.sttLang = sttLang; this.onEvent = onEvent;
     this.apiKey = apiKey; this.sttTokenUrl = sttTokenUrl; this.sttUrl = sttUrl; this.sttModel = sttModel;
     this.micDeviceId = micDeviceId; this.prerollMax = preroll; this.vadOptions = vadOptions;
     this.tools = { ...(onTask ? { create_task: { ...CREATE_TASK_TOOL, run: onTask } } : {}), ...tools };
@@ -380,4 +382,3 @@ export class PiperTTS {
   }
   stop() { try { this._node?.stop(); } catch {} }
 }
-const defaultTTS = new PiperTTS();
