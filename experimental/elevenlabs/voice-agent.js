@@ -189,7 +189,15 @@ export class VoiceAgent {
 
   // ── STT (Scribe, VAD-gated, manual commit, lazy reconnect) ──────────────
   async _openWs() {
-    const { token } = await (await fetch(this.sttTokenUrl, { method: 'POST', headers: { 'X-API-Key': this.apiKey } })).json();
+    // Surface token-route failures here (clear error) instead of connecting with
+    // token=undefined and getting an opaque `auth_error` back from the STT socket.
+    const res = await fetch(this.sttTokenUrl, { method: 'POST', headers: { 'X-API-Key': this.apiKey } });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || !body.token) {
+      this.onEvent({ type: 'error', error: `STT token: ${body.error || body.message || res.statusText}` });
+      return;
+    }
+    const { token } = body;
     const p = new URLSearchParams({ model_id: this.sttModel, commit_strategy: 'manual', audio_format: 'pcm_16000', token });
     if (this.sttLang) p.set('language_code', this.sttLang);
     for (const k of this.keyterms) p.append('keyterms', k);   // repeated param, not comma-joined — bias STT towards domain terms
