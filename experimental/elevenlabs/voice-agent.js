@@ -305,7 +305,10 @@ function sentenceEnd(s) {
 const CDN_PIPER = `${CDN}@mintplex-labs/piper-tts-web@1.0.4/dist/piper-tts-web.js`;
 export class PiperTTS {
   constructor(voiceId = 'hu_HU-anna-medium') { this.voiceId = voiceId; this._ctx = null; this._node = null; }
-  async _tts() { return this._lib ??= await import(/* @vite-ignore */ CDN_PIPER); }
+  // webpackIgnore is honored by webpack AND Turbopack (vite needs its own marker) — without it
+  // bundlers rewrite this into their runtime require, which can't load a URL
+  // ("turbopack_context.x is not a function").
+  async _tts() { return this._lib ??= await import(/* webpackIgnore: true */ /* @vite-ignore */ CDN_PIPER); }
 
   // List installable Piper voices: [{ id, name, language }]. `id` is what you pass as
   // `voiceId` (lib calls it `key`). Lets the UI build a voice picker; switch with setVoice.
