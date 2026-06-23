@@ -45,14 +45,15 @@ export class VoiceAgent {
   //     `apiKey` (X-API-Key) authenticates both — keys stay server-side behind them.
   //     `llmUrl`/`sttTokenUrl` override the individual routes if needed.
   //   `sttUrl`/`sttModel` — STT realtime socket + model id (ElevenLabs Scribe by default).
+  //   `sttUsageUrl` — backend route the client reports streamed STT seconds to (trust-but-verify billing).
   //   `maxTokens`, `preroll` (chunks kept before VAD fires), `vadOptions` (Silero overrides).
   constructor({ sysmsg = '', llm, apiKey = '', baseUrl = BASE_URL, llmUrl = `${baseUrl}/llm`, maxTokens = 1024,
-                tts, sttLang = 'hu', micDeviceId = '', sttTokenUrl = `${baseUrl}/stt/token`, sttUrl = STT_URL, sttModel = STT_MODEL,
+                tts, sttLang = 'hu', micDeviceId = '', sttTokenUrl = `${baseUrl}/stt/token`, sttUsageUrl = `${baseUrl}/stt/usage`, sttUrl = STT_URL, sttModel = STT_MODEL,
                 tools = {}, onTask, keyterms = [], preroll = PREROLL_CHUNKS, vadOptions = {}, onEvent = () => {} } = {}) {
     // Each agent gets its own PiperTTS (it owns an AudioContext + playing node) — a shared
     // module-level default would make two agents fight over one audio output.
     this.sysmsg = sysmsg; this.tts = tts ?? new PiperTTS(); this.sttLang = sttLang; this.onEvent = onEvent;
-    this.apiKey = apiKey; this.sttTokenUrl = sttTokenUrl; this.sttUrl = sttUrl; this.sttModel = sttModel;
+    this.apiKey = apiKey; this.sttTokenUrl = sttTokenUrl; this.sttUsageUrl = sttUsageUrl; this.sttUrl = sttUrl; this.sttModel = sttModel;
     this.micDeviceId = micDeviceId; this.prerollMax = preroll; this.vadOptions = vadOptions;
     this.tools = { ...(onTask ? { create_task: { ...CREATE_TASK_TOOL, run: onTask } } : {}), ...tools };
     this.keyterms = keyterms.filter(k => k && k.length <= 20).slice(0, 50);
@@ -63,6 +64,7 @@ export class VoiceAgent {
     this.state = 'idle';           // idle | listening | thinking | speaking
     this._abort = null;            // aborts the in-flight LLM
     this._ws = null; this._preroll = []; this._wasSpeaking = false; this._outbox = []; this._closed = false;
+    this._sttSamples = 0;          // 16kHz samples streamed to Scribe since the last usage report
   }
 
   // `deviceId` pins the mic to listen on — enumerate inputs host-side via
@@ -85,7 +87,23 @@ export class VoiceAgent {
     this._closed = true; this._abort?.abort(); this.tts.stop?.();
     this._vad?.pause(); this._ws?.close();
     this._node?.disconnect(); this._ctx?.close(); this._stream?.getTracks().forEach(t => t.stop());
+    this._reportUsage();
     this._set('idle');
+  }
+
+  // Trust-but-verify STT billing: report the audio seconds we actually streamed to Scribe so the
+  // backend can charge the authenticated user (it can't meter the direct browser↔ElevenLabs WS).
+  // Flushed whenever the WS closes (idle/reconnect) and on stop(); `keepalive` so a tab close
+  // mid-flight still delivers. Resets the counter so seconds are never double-charged.
+  _reportUsage() {
+    const seconds = this._sttSamples / 16000;
+    this._sttSamples = 0;
+    if (seconds <= 0 || !this.sttUsageUrl) return;
+    fetch(this.sttUsageUrl, {
+      method: 'POST', keepalive: true,
+      headers: { 'Content-Type': 'application/json', 'X-API-Key': this.apiKey },
+      body: JSON.stringify({ seconds }),
+    }).catch(() => {});   // best-effort; periodic reconciliation against the ElevenLabs total is the backstop
   }
 
   _set(s) { this.state = s; this.onEvent({ type: 'state', state: s }); }
@@ -205,7 +223,7 @@ export class VoiceAgent {
     this._ws = new WebSocket(`${this.sttUrl}?${p}`);
     this._ws.onopen = () => { const q = this._outbox; this._outbox = []; for (const it of q) it === 'commit' ? this._sendCommit() : this._sendAudio(it); };
     this._ws.onerror = ev => { this.onEvent({ type: 'error', error: 'STT socket error' }); console.error('STT ws error', ev); };
-    this._ws.onclose  = ev => { if (ev.code !== 1000) { this.onEvent({ type: 'error', error: `STT closed ${ev.code}: ${ev.reason || 'no reason'}` }); console.error('STT ws closed', ev.code, ev.reason, 'clean:', ev.wasClean); } };
+    this._ws.onclose  = ev => { this._reportUsage(); if (ev.code !== 1000) { this.onEvent({ type: 'error', error: `STT closed ${ev.code}: ${ev.reason || 'no reason'}` }); console.error('STT ws closed', ev.code, ev.reason, 'clean:', ev.wasClean); } };
     this._ws.onmessage = ev => {
       const m = JSON.parse(ev.data);
       const ms = Math.round(performance.now() - this._sttStart);
@@ -233,6 +251,7 @@ export class VoiceAgent {
     if (!this._ws || this._ws.readyState !== 1) { this._outbox.push(i16); return; }
     let bin = ''; const b = new Uint8Array(i16.buffer); for (let i = 0; i < b.length; i++) bin += String.fromCharCode(b[i]);
     this._ws.send(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: btoa(bin) }));
+    this._sttSamples += i16.length;   // count only audio actually sent to Scribe (16kHz mono) — basis for usage billing
   }
   _sendCommit() { this._ws.send(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: '', commit: true })); }
   _commit() { if (this._ws?.readyState === 1) this._sendCommit(); else this._outbox.push('commit'); }
