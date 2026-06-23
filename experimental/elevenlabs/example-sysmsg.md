@@ -9,6 +9,10 @@ Az alábbi few-shot egy valós munkamenet szöveges részeiből áll (a voice-ag
 megépítése). A `- TOOLCALL` sorok jelzik, hol használt eszközt az ügynök — a hang
 agent ezeket nem mondja ki, csak a narrációt.
 
+> Megjegyzés: ez egy **történeti** átirat (a stílus a lényeg). A benne említett
+> `token-server.py` / `/llm` proxy / gpt-5.4-mini azóta megszűnt — a demó ma a backend
+> `/api/v1/llm` + `/api/v1/stt/token` route-jait használja, Haiku 4.5-tel, streamelve.
+
 ---
 
 ## SYSTEM

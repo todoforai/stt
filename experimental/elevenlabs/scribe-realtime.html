@@ -75,6 +75,9 @@
 <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js"></script>
 <script type="module">
 const $ = id => document.getElementById(id);
+// STT token from the backend (key stays server-side); set `tfa_api_key` in localStorage for X-API-Key.
+const TOKEN_URL = 'http://localhost:4000/api/v1/stt/token';
+const API_KEY = localStorage.getItem('tfa_api_key') || '';
 const t0 = performance.now();
 const ts = () => ((performance.now() - t0) / 1000).toFixed(2).padStart(6) + 's';
 const log = (...a) => { $('log').textContent += ts() + '  ' + a.join(' ') + '\n'; $('log').scrollTop = 1e9; console.log(...a); };
@@ -93,7 +96,7 @@ class Channel {
   }
   async open(lang) {
     this.lang = lang;
-    const { token } = await (await fetch('/token', { method: 'POST' })).json();
+    const { token } = await (await fetch(TOKEN_URL, { method: 'POST', headers: { 'X-API-Key': API_KEY } })).json();
     // A: server-side VAD commits on silence. B: manual — we commit via local VAD's onSpeechEnd.
     const p = new URLSearchParams({
       model_id: 'scribe_v2_realtime',

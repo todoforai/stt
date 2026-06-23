@@ -65,4 +65,4 @@ Trailing phrases trigger actions instead of being typed:
 The `experimental/` directory contains alternative STT approaches:
 
 - **canary/** — GPU-accelerated client-server using NVIDIA Canary-Qwen 2.5B (Python, requires CUDA)
-- **elevenlabs/** — Cloud-based streaming via ElevenLabs Scribe v2 API (Python, requires API key)
+- **elevenlabs/** — Cloud-based streaming voice agent via ElevenLabs Scribe v2 (browser JS; LLM + STT token come from the TODOforAI backend, keys server-side)

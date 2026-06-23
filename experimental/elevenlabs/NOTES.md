@@ -1,7 +1,7 @@
 # Scribe v2 Realtime — notes & next steps
 
-Browser test: `scribe-realtime.html` + `token-server.py`
-(key stays server-side; browser gets a 15-min `sutkn_…` single-use token).
+Browser test: `scribe-realtime.html` (STT token from the backend `/api/v1/stt/token`;
+key stays server-side, browser gets a 15-min `sutkn_…` single-use token).
 
 ## Auth (browser)
 - WS cannot send custom headers → `xi-api-key` won't work client-side.

@@ -43,8 +43,8 @@ reply        = LLM.gen(chat_history, sysmsg)   # streamed, per sentence → TTS
 1. **Mount on a target.** Pick the element holding the text (CSS selector / "last
    message" node). Extract `anchorText` (+ title/author if useful).
 2. **Drop in the voice module** (the 4 swappable interfaces from `README.md`):
-   `VAD` / `STT` / `LLM` / `TTS`. Add a tiny token server endpoint for the STT
-   key (and LLM key if cloud) — never ship keys to the browser.
+   `VAD` / `STT` / `LLM` / `TTS`. Point `tokenUrl`/`llmUrl` at the backend routes
+   (`/api/v1/stt/token`, `/api/v1/llm`) — keys stay server-side, never in the browser.
 3. **Wire the prompt.** `sysmsg = debatePrompt(anchorText)`. Start `chat_history`
    empty (or seed with a one-line opener the bot speaks first).
 4. **Run the state machine** (LISTENING → THINKING → SPEAKING, barge-in →
