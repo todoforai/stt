@@ -117,9 +117,11 @@ Conversation so far:
 
   <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js"></script>
-  <!-- Piper imports "onnxruntime" as a bare specifier; map it (esm.sh's Node shims break Emscripten). -->
+  <!-- Piper imports "onnxruntime-web" as a bare specifier; map it to jsDelivr's self-contained +esm
+       bundle (same CDN + version as ort.js above). esm.sh was flaky in prod: its entry is a tiny stub
+       that re-imports a second chunk, and that dynamic import failed intermittently. -->
   <script type="importmap">
-  { "imports": { "onnxruntime-web": "https://esm.sh/onnxruntime-web@1.18.0" } }
+  { "imports": { "onnxruntime-web": "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/+esm" } }
   </script>
   <script type="module">
     import { VoiceAgent, PiperTTS } from './voice-agent.js';
